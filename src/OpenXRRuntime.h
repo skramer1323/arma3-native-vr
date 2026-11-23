@@ -17,10 +17,10 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -46,9 +46,10 @@ private:
     bool CreateSession();
     void DestroySession();
     void PollEvents();
+    void ApplyLocalSpaceChanges();
     void HandleSessionState(XrSessionState state);
     void PrepareNextFrame();
-    void PrepareFollowingFrame(IDXGISwapChain* swapChain);
+    void PrepareFollowingFrame();
     bool SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQuad);
     void SaveProjectionEyeImages(ID3D11Texture2D* frame, int renderedEye, bool synthetic, bool fullEye,
                                  int warpedEye);
@@ -58,13 +59,8 @@ private:
     void TraceSubmittedFrame(int renderedEye, std::uint32_t matchedPose, std::uint32_t layerCount,
                              const XrCompositionLayerProjectionView views[2], XrResult result,
                              double submitMs, bool dlssSubmitted, bool staleWarpSubmitted,
-                             const char* viewKind, const char* viewSpace, std::uint32_t drawPoseId);
-    enum class FrameMode { FullStereo, StaleEye, NativeAer, Dibr, DibrForward };
-    struct FrameSelection {
-        FrameMode mode;
-        AerWarpMode warp;
-    };
-    void SetFrameMode(FrameMode mode);
+                             const char* viewKind, const char* viewSpace, std::uint32_t drawPoseId,
+                             float submittedRoll);
     struct RenderPose;
     bool EnsureQuadSwapchain(const D3D11_TEXTURE2D_DESC& backBuffer);
     void DestroyQuadSwapchain();
@@ -95,7 +91,8 @@ private:
     void PublishHeadPose();
     bool ReadGameFov(float& tanHalfHorizontal, float& tanHalfVertical);
 
-    void BuildWorldView(XrCompositionLayerQuad& quad, const RenderPose& pose, int eye) const;    void HandleHotkeys(IDXGISwapChain* swapChain);
+    void BuildWorldView(XrCompositionLayerQuad& quad, const RenderPose& pose, int eye) const;
+    void HandleHotkeys();
     void LogStats();
     bool Check(XrResult result, const char* operation) const;
 
@@ -115,6 +112,13 @@ private:
     XrSession m_session = XR_NULL_HANDLE;
     XrSpace m_localSpace = XR_NULL_HANDLE;
     XrSpace m_viewSpace = XR_NULL_HANDLE;
+    struct LocalSpaceChange {
+        XrTime time;
+        XrPosef newInOld;
+        bool valid;
+    };
+    XrPosef m_localSpaceOffset{{0.0F, 0.0F, 0.0F, 1.0F}, {}};
+    std::deque<LocalSpaceChange> m_localSpaceChanges;
     XrSessionState m_sessionState = XR_SESSION_STATE_UNKNOWN;
     bool m_sessionRunning = false;
     bool m_framePrepared = false;
@@ -123,7 +127,6 @@ private:
     int m_renderEye = -1;
     bool m_alternateEyeProjection = false;
     bool m_dibrShift = false;
-    std::optional<FrameSelection> m_pendingFrameMode;
     int m_dibrFill = 1;  // DIBR hole fill: 0 magenta (diagnostic), 1 stale eye + background, 2 background
     XrSwapchain m_dibrSwapchain = XR_NULL_HANDLE;
     std::vector<XrSwapchainImageD3D11KHR> m_dibrImages;
@@ -219,7 +222,7 @@ private:
     float m_weaponScale = 0.3F;
     float m_weaponConvergence = 0.7F;
     float m_weaponSize = 0.6F;
-    int m_poseLag = 1;  // Base offset for selecting the render pose.
+    int m_poseLag = 1;  // screen height offset (Ctrl+PgUp/PgDn), as in the Tarkov mod
     bool m_tuningInitialized = false;
 
     // World-fixed quad pose in LOCAL space (QuadAnchor=1).

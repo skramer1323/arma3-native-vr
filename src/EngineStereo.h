@@ -14,13 +14,15 @@ namespace a3vr {
 // repeated once more: the render target is split in two halves (left eye, right
 // eye), and the projection matrix of the second draw is shifted sideways.
 //
-// Projection layout observed in build 2.22.0.154089:
-//  - Scene vertex shaders transform their view-space positions with
+// Evidence (frame probe, build 2.22.0.154089, capture of 2026-11-17):
+//  - PROVEN: every scene vertex shader ends with
 //      o0 = view.x*cb2[0] + view.y*cb2[1] + view.z*cb2[2] + cb2[3]
 //    and cb2 (112 bytes) holds the projection matrix, equal to the export
 //    RVGetProjectionViewTransform. Floats 8 and 12 (cb2[2].x, cb2[3].x) are 0.
 //  - Setting float8 = s*P00*d/C and float12 = -s*P00*d moves the camera by
 //    s*d sideways (s = -1 left, +1 right) and keeps distance C on the screen plane.
+//  - The scene is drawn into 2048x864 targets with an R24G8 depth buffer, the
+//    final image is composed into the 4096x1728 back buffer.
 //
 // The result is a side-by-side picture in the back buffer. The OpenXR side shows
 // the left half to the left eye and the right half to the right eye (SbsInput).
@@ -41,6 +43,8 @@ public:
 private:
     void Begin(UINT elementCount, bool instanced);
     void SetEye(int eye);
+    UINT ProjectionVariant(int eye, bool projected) const;
+    ID3D11Buffer* PrepareEyeProjection(UINT variant, bool projected);
     bool BeginBodyMask(ID3D11VertexShader* shader);
     void BindStereoShadows(ID3D11RenderTargetView* target);
 
@@ -56,9 +60,11 @@ private:
     bool m_weapon = false;  // first-person weapon layer (viewport depth 0..0.01)
     bool m_mainWorldDepth = false;
     bool m_foveatedWorld = false;
+    bool m_singlePassStereo = false;
     bool m_firstPersonClip = false;
     Microsoft::WRL::ComPtr<ID3D11GeometryShader> m_bodyMask;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_savedGeometryConstants;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_savedDepthGeometryConstants;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_originalShadowShader;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_savedShadowConstants;
     bool m_native = false;  // AER native: this draw fills the whole target (one eye per frame)
@@ -91,9 +97,10 @@ void EngineStereoSetRenderEye(int eye, bool captureDibrDepth = false);
 struct WorldDepthProjection {
     float depthScale = 0.0F;  // native M22
     float depthBias = 0.0F;   // native M32, before translation
-    float clipWOffset = 0.0F;
+    float clipWOffset = 0.0F;  // physical headset and placement, in clip W
     bool valid = false;
     std::array<float, 16> view{};
+    std::array<float, 3> yawOrbitCorrection{};
 };
 WorldDepthProjection EngineStereoLastWorldDepthProjection();
 class FreeTrackFeed;
@@ -126,7 +133,7 @@ void EngineStereoSetHud(bool active, float scale, float shiftX, float shiftY, fl
 void EngineStereoSetWeapon(float separationScale, float convergenceMeters, float sizeScale);
 // Headset projection mode (world view, ProjectionLayer=1): each eye is drawn with the headset's
 // own frustum (tangents left/right/up/down per eye: 8 values) and eye offset, and the frame is
-// submitted as a projection layer. halfIpdMeters includes the depth scale.
+// submitted as a projection layer (as Tarkov KBM VR does). halfIpdMeters includes the depth scale.
 // aimBias: -1 puts the right eye on the sight line while aiming, +1 the left eye, 0 neither
 // (fractions blend in and out).
 void EngineStereoSetHeadset(bool active, float halfIpdMeters, const float tangents[8],

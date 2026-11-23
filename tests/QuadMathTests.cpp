@@ -1,4 +1,6 @@
 #include "QuadMath.h"
+#include "XrPoseMath.h"
+#include "WorldShadingMask.h"
 
 #include <cmath>
 #include <cstdio>
@@ -53,6 +55,77 @@ int main()
     Expect(Near(CameraRollFromView(0.12F * std::sin(0.4F), 0.12F * std::cos(0.4F)), 0.2F),
            "roll correction tapers as the view approaches vertical");
     Expect(CameraRollFromView(NAN, 1.0F) == 0.0F, "invalid camera basis is ignored");
+    Expect(OnFootCameraRollFromView(0.0F, -0.56F) == 0.0F,
+           "pitching past vertical does not introduce a half-turn on foot");
+    Expect(Near(OnFootCameraRollFromView(0.04F, -0.56F),
+                OnFootCameraRollFromView(0.04F, 0.56F)),
+           "an inverted up vector does not change the on-foot roll correction");
+    Expect(Near(OnFootCameraRollFromView(0.0F, 0.02F), 0.0F) &&
+               Near(OnFootCameraRollFromView(0.0F, -0.02F), 0.0F),
+           "both sides of the vertical crossing remain continuous");
+
+    constexpr std::array<float, 16> forwardView{
+        1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F,
+        0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F};
+    const auto centered = WorldYawOrbitCorrection(forwardView, 0.0F, 0.07F, 0.04F);
+    Expect(centered == std::array<float, 3>{}, "yaw correction leaves the centered anchor alone");
+    for (float side : {-1.0F, 1.0F}) {
+        const std::array<float, 16> turnedView{
+            0.0F, 0.0F, -side, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F,
+            side, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F};
+        const auto correction =
+            WorldYawOrbitCorrection(turnedView, side * std::atan2(1.0F, 0.0F), 0.07F, 0.04F);
+        const float cameraX = -side * (0.07F + correction[2]);
+        const float cameraZ = side * (0.04F + correction[0]);
+        Expect(Near(cameraX, 0.04F) && Near(cameraZ, 0.07F) && Near(correction[1], 0.0F),
+               "both yaw directions return the native orbit to its neutral anchor");
+    }
+    const std::array<float, 16> verticalView{};
+    const auto vertical = WorldYawOrbitCorrection(verticalView, 0.8F, 0.07F, 0.04F);
+    Expect(vertical == std::array<float, 3>{}, "vertical view has no reliable yaw correction");
+
+    const XrPosef newLocalInOld{{0.0F, std::sin(0.3F), 0.0F, std::cos(0.3F)},
+                               {1.5F, 0.2F, -0.5F}};
+    const auto rebasedIdentity = RebaseLocalOffset(kIdentityXrPose, newLocalInOld);
+    Expect(Near(rebasedIdentity.orientation.y, -newLocalInOld.orientation.y) &&
+           Near(rebasedIdentity.orientation.w, newLocalInOld.orientation.w),
+           "the anchored origin rotates opposite a LOCAL origin change");
+    const XrPosef anchorInOld{{std::sin(0.2F), 0.0F, 0.0F, std::cos(0.2F)},
+                             {-0.3F, 1.0F, -2.0F}};
+    const auto rebasedAnchor = RebaseLocalOffset(anchorInOld, newLocalInOld);
+    const auto translatedBack = Rotate(newLocalInOld.orientation, rebasedAnchor.position);
+    const auto rotatedBack = Multiply(newLocalInOld.orientation, rebasedAnchor.orientation);
+    Expect(Near(translatedBack.x + newLocalInOld.position.x, anchorInOld.position.x) &&
+           Near(translatedBack.y + newLocalInOld.position.y, anchorInOld.position.y) &&
+           Near(translatedBack.z + newLocalInOld.position.z, anchorInOld.position.z) &&
+           Near(rotatedBack.x, anchorInOld.orientation.x) &&
+           Near(rotatedBack.y, anchorInOld.orientation.y) &&
+           Near(rotatedBack.z, anchorInOld.orientation.z) &&
+           Near(rotatedBack.w, anchorInOld.orientation.w),
+           "rebasing a translated and rotated origin preserves the anchor pose");
+
+    const WorldShadingProjection normalEyes[2]{{1.0F, 1.0F, 0.0F, 0.0F},
+                                                {1.0F, 1.0F, 0.0F, 0.0F}};
+    Expect(WorldShadingTileRate(8, 8, 512, 256, normalEyes) == WorldTileRate::Full &&
+           WorldShadingTileRate(24, 8, 512, 256, normalEyes) == WorldTileRate::Full,
+           "both eye centers keep one shader evaluation per pixel");
+    Expect(WorldShadingTileRate(13, 8, 512, 256, normalEyes) == WorldTileRate::Full &&
+           WorldShadingTileRate(14, 8, 512, 256, normalEyes) == WorldTileRate::TwoByOne,
+           "the central cone keeps full rate and peripheral tiles reduce shading");
+    Expect(WorldShadingTileRate(0, 0, 512, 256, normalEyes) == WorldTileRate::TwoByTwo,
+           "the outer corners can use quarter-rate shading");
+    Expect(WorldShadingTileRate(16, 0, 528, 256, normalEyes) == WorldTileRate::Full,
+           "a hardware tile shared by the two eye images uses full rate");
+    const WorldShadingProjection wideEyes[2]{{0.5F, 1.0F, 0.0F, 0.0F},
+                                              {1.0F, 1.0F, 0.0F, 0.0F}};
+    Expect(WorldShadingTileRate(13, 8, 512, 256, wideEyes) == WorldTileRate::TwoByTwo &&
+           WorldShadingTileRate(29, 8, 512, 256, wideEyes) == WorldTileRate::Full,
+           "angular masks use each eye's projection scale");
+    const WorldShadingProjection invalidEyes[2]{{0.0F, 1.0F, 0.0F, 0.0F},
+                                                 normalEyes[1]};
+    Expect(WorldShadingTileRate(0, 0, 512, 256, invalidEyes) == WorldTileRate::Full,
+           "invalid projection uses full shading");
+
     Expect(Near(ClampQuadWidth(100.0F), 20.0F), "width upper clamp");
     Expect(Near(ClampQuadWidth(NAN), 2.4F), "width NaN fallback");
     Expect(Near(ClampQuadDistance(0.0F), 0.3F), "distance lower clamp");

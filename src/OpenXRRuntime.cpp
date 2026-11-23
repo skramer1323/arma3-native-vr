@@ -12,6 +12,7 @@
 #include "ResolutionHook.h"
 #include "Log.h"
 #include "QuadMath.h"
+#include "XrPoseMath.h"
 
 #include <imgui.h>
 
@@ -61,18 +62,6 @@ XrQuaternionf YawOnly(const XrQuaternionf& q)
     return {0.0F, std::sin(yaw * 0.5F), 0.0F, std::cos(yaw * 0.5F)};
 }
 
-XrVector3f Rotate(const XrQuaternionf& q, const XrVector3f& v)
-{
-    const float cx = q.y * v.z - q.z * v.y;
-    const float cy = q.z * v.x - q.x * v.z;
-    const float cz = q.x * v.y - q.y * v.x;
-    const float ccx = q.y * cz - q.z * cy;
-    const float ccy = q.z * cx - q.x * cz;
-    const float ccz = q.x * cy - q.y * cx;
-    return {v.x + 2.0F * (q.w * cx + ccx), v.y + 2.0F * (q.w * cy + ccy),
-            v.z + 2.0F * (q.w * cz + ccz)};
-}
-
 XrCompositionLayerQuad QuadFromProjectionView(const XrCompositionLayerProjectionView& view,
                                              XrSpace space, XrEyeVisibility eye)
 {
@@ -111,19 +100,6 @@ bool IsBgra(DXGI_FORMAT format)
            format == DXGI_FORMAT_B8G8R8X8_UNORM || format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
 }
 
-XrQuaternionf Multiply(const XrQuaternionf& a, const XrQuaternionf& b)
-{
-    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
-}
-
-XrQuaternionf Conjugate(const XrQuaternionf& q)
-{
-    return {-q.x, -q.y, -q.z, q.w};
-}
-
 // Positive yaw turns left (counter-clockwise seen from above), positive pitch looks up.
 XrQuaternionf YawPitch(float yaw, float pitch)
 {
@@ -141,12 +117,6 @@ bool WindowsCursorShowing()
 
 constexpr float kDegrees = 57.29578F;
 
-bool KeyPressed(int key)
-{
-    return (GetAsyncKeyState(key) & 1) != 0;
-}
-
-// Press edge from the key state itself (GetAsyncKeyState bit 0 is shared with every other reader).
 bool KeyEdge(int key, bool& previous)
 {
     const bool now = (GetAsyncKeyState(key) & 0x8000) != 0;
@@ -208,7 +178,7 @@ bool OpenXRRuntime::AttachDevice(IDXGISwapChain* swapChain)
     if (SUCCEEDED(m_device.As(&dxgiDevice)) && SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
         adapter->GetDesc(&adapterDescription);
     }
-    Log("DXGI main swapchain %p: %ux%u format=%d buffers=%u swapEffect=%d windowed=%d "
+    Log("RUNG1 main swapchain %p: %ux%u format=%d buffers=%u swapEffect=%d windowed=%d "
         "msaa=%u refresh=%u/%u flags=0x%X hwnd=%p",
         swapChain, swapDescription.BufferDesc.Width, swapDescription.BufferDesc.Height,
         static_cast<int>(swapDescription.BufferDesc.Format), swapDescription.BufferCount,
@@ -229,7 +199,7 @@ bool OpenXRRuntime::AttachDevice(IDXGISwapChain* swapChain)
              client.bottom == static_cast<LONG>(swapDescription.BufferDesc.Height))
                 ? "match" : "MISMATCH (the cursor will be off)");
     }
-    Log("D3D11 device %p featureLevel=0x%X createFlags=0x%X adapter=\"%ls\" "
+    Log("RUNG1 D3D11 device %p featureLevel=0x%X createFlags=0x%X adapter=\"%ls\" "
         "presentThread=%lu",
         m_device.Get(), static_cast<unsigned>(m_device->GetFeatureLevel()),
         m_device->GetCreationFlags(), adapterDescription.Description, m_presentThread);
@@ -245,7 +215,9 @@ bool OpenXRRuntime::CreateSession()
         std::vector<XrApiLayerProperties> layers(layerCount, {XR_TYPE_API_LAYER_PROPERTIES});
         xrEnumerateApiLayerProperties(layerCount, &layerCount, layers.data());
         for (const XrApiLayerProperties& layer : layers) {
-            Log("OpenXR API layer available: %s", layer.layerName);
+            Log("OpenXR API layer available: %s (VectorXR/other layers should be off for "
+                "lab tests)",
+                layer.layerName);
         }
 
         const char* extensions[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
@@ -256,7 +228,7 @@ bool OpenXRRuntime::CreateSession()
         strncpy_s(createInfo.applicationInfo.engineName, "RealVirtuality4",
                   XR_MAX_ENGINE_NAME_SIZE - 1);
         createInfo.applicationInfo.engineVersion = 1;
-        // Request OpenXR 1.0 for compatibility with runtime versions that reject 1.1.
+        // Virtual Desktop rejects apiVersion 1.1 (KCD1VR trap): ask for 1.0.0.
         createInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
         createInfo.enabledExtensionCount = 1;
         createInfo.enabledExtensionNames = extensions;
@@ -267,7 +239,7 @@ bool OpenXRRuntime::CreateSession()
         XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
         if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &properties))) {
             m_steamVr = std::strncmp(properties.runtimeName, "SteamVR", 7) == 0;
-            Log("OpenXR runtime: %s %u.%u.%u; requested API 1.0.0",
+            Log("RUNG2 OpenXR runtime: %s %u.%u.%u; requested API 1.0.0",
                 properties.runtimeName, XR_VERSION_MAJOR(properties.runtimeVersion),
                 XR_VERSION_MINOR(properties.runtimeVersion),
                 XR_VERSION_PATCH(properties.runtimeVersion));
@@ -331,7 +303,7 @@ bool OpenXRRuntime::CreateSession()
         DestroySession();
         return false;
     }
-    Log("OpenXR session created on \"%ls\" (diagnostic mode %d)",
+    Log("RUNG2 OpenXR session created on \"%ls\" (diagnostic mode %d)",
         adapterDescription.Description, GetConfig().openXrDiagnosticMode);
     XrSystemProperties systemProperties{XR_TYPE_SYSTEM_PROPERTIES};
     if (XR_SUCCEEDED(xrGetSystemProperties(m_instance, m_systemId, &systemProperties))) {
@@ -392,6 +364,8 @@ void OpenXRRuntime::DestroySession()
     m_sessionRunning = false;
     m_framePrepared = false;
     m_sessionState = XR_SESSION_STATE_UNKNOWN;
+    m_localSpaceChanges.clear();
+    m_localSpaceOffset = kIdentityXrPose;
     m_worldQuadValid = false;
     m_recenterRequested = true;
 }
@@ -411,9 +385,13 @@ void OpenXRRuntime::PollEvents()
             const auto& change =
                 reinterpret_cast<const XrEventDataReferenceSpaceChangePending&>(event);
             if (change.session == m_session && change.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
-                Log("OpenXR LOCAL space changed; requesting recenter");
-                m_recenterRequested = true;
-                m_headRecenterRequested = true;
+                const auto next = std::upper_bound(m_localSpaceChanges.begin(), m_localSpaceChanges.end(),
+                    change.changeTime, [](XrTime time, const LocalSpaceChange& pending) {
+                        return time < pending.time;
+                    });
+                const bool valid = change.poseValid == XR_TRUE;
+                m_localSpaceChanges.insert(next,
+                    {change.changeTime, valid ? change.poseInPreviousSpace : kIdentityXrPose, valid});
             }
         } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             Log("OpenXR instance loss pending; session will be recreated");
@@ -427,16 +405,52 @@ void OpenXRRuntime::PollEvents()
     }
 }
 
+void OpenXRRuntime::ApplyLocalSpaceChanges()
+{
+    if (m_localSpaceChanges.empty() || m_localSpaceChanges.front().time > m_displayTime) {
+        return;
+    }
+    XrPosef offset = m_localSpaceOffset;
+    bool preserveAnchor = true;
+    do {
+        const auto& change = m_localSpaceChanges.front();
+        if (change.valid) {
+            offset = RebaseLocalOffset(offset, change.newInOld);
+        } else {
+            offset = kIdentityXrPose;
+            preserveAnchor = false;
+        }
+        m_localSpaceChanges.pop_front();
+    } while (!m_localSpaceChanges.empty() && m_localSpaceChanges.front().time <= m_displayTime);
+
+    XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    info.poseInReferenceSpace = offset;
+    XrSpace replacement = XR_NULL_HANDLE;
+    if (Check(xrCreateReferenceSpace(m_session, &info, &replacement), "rebasing LOCAL space")) {
+        xrDestroySpace(m_localSpace);
+        m_localSpace = replacement;
+        m_localSpaceOffset = offset;
+        if (preserveAnchor) {
+            Log("OpenXR LOCAL space rebased; preserving head and world anchors");
+            return;
+        }
+    }
+    Log("OpenXR LOCAL space continuity unavailable; requesting recenter");
+    m_recenterRequested = true;
+    m_headRecenterRequested = true;
+}
+
 void OpenXRRuntime::HandleSessionState(XrSessionState state)
 {
     m_sessionState = state;
-    Log("OpenXR session state -> %d", static_cast<int>(state));
+    Log("RUNG2 OpenXR session state -> %d", static_cast<int>(state));
     if (state == XR_SESSION_STATE_READY && !m_sessionRunning) {
         XrSessionBeginInfo beginInfo{XR_TYPE_SESSION_BEGIN_INFO};
         beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         if (Check(xrBeginSession(m_session, &beginInfo), "beginning session")) {
             m_sessionRunning = true;
-            Log("OpenXR session running");
+            Log("RUNG2 session running");
         }
     } else if (state == XR_SESSION_STATE_STOPPING && m_sessionRunning) {
         if (m_framePrepared) {
@@ -480,6 +494,7 @@ void OpenXRRuntime::PrepareNextFrame()
     m_shouldRender = frameState.shouldRender == XR_TRUE;
     m_displayTime = frameState.predictedDisplayTime;
     m_displayPeriod = frameState.predictedDisplayPeriod;
+    ApplyLocalSpaceChanges();
     PublishHeadPose();
 }
 
@@ -509,7 +524,8 @@ void OpenXRRuntime::PublishHeadPose()
         m_headRecenterRequested = false;
         m_aiming = false;  // the aiming baseline belongs to the old reference
         // F11 also clears the right-click aiming latch (it can disagree with the game after a
-        // missed click, the R key, a reload or a weapon change), so the view and sight realign.
+        // missed click, the R key, a reload or a weapon change): the sight is re-aligned like in
+        // the Tarkov mod, where F11 re-centres view, hands and sight together.
         m_adsMouseLatched = false;
         m_adsMousePress = 0;
         m_adsBlend = 0.0F;
@@ -547,6 +563,9 @@ void OpenXRRuntime::PublishHeadPose()
     const bool stereo = config.stereoMode == 1 && m_stereoEnabled && m_worldViewState == 1;
     const int eye = stereo ? ((++m_publishCount & 1U) != 0 ? 1 : -1) : 0;
     const float swap = m_stereoSwap ? -1.0F : 1.0F;
+    // Aiming, as in the Tarkov KBM VR mod: while aiming the view follows the game camera (the
+    // sight line, so bullets go where the sight points); only the head motion since aiming
+    // started turns it further. Aiming = right mouse button held, or the game zoomed in.
     // Head offset from the recentre position (LOCAL space, metres).
     XrVector3f delta{0.0F, 0.0F, 0.0F};
     if (havePosition) {
@@ -745,7 +764,10 @@ void OpenXRRuntime::PublishHeadPose()
             tz = std::clamp(-inCamera.z * scale, -limit, limit);
         }
         EngineStereoSetLean(tx, ty, tz);
-        // Fade lateral and vertical placement while aiming to align the eye with the sight.
+        // Aiming (like the ADS camera of the Tarkov mod): the eye goes onto the sight line, so the
+        // sideways/vertical head placement fades out while the sight is up. Otherwise the sight is
+        // seen from a point beside the bore and the collimator mark does not sit where the bullets
+        // go (seen 2026-11-19 with HeadOffset right 0.02 up 0.04). The depth part stays.
         const float placementKeep = 1.0F - m_adsBlend;
         EngineStereoSetHeadOffset(m_appliedOffset[0] * placementKeep,
                                   m_appliedOffset[1] * placementKeep, m_appliedOffset[2]);
@@ -1072,7 +1094,7 @@ bool OpenXRRuntime::EnsureQuadSwapchain(const D3D11_TEXTURE2D_DESC& backBuffer)
     if (!m_quadImages.empty() && m_quadImages[0].texture) {
         m_quadImages[0].texture->GetDesc(&imageDescription);
     }
-    Log("OpenXR quad swapchain %ux%u images=%u source format=%d OpenXR format=%d "
+    Log("RUNG3 quad swapchain %ux%u images=%u source format=%d OpenXR format=%d "
         "image texture format=%d",
         m_quadWidth, m_quadHeight, imageCount, static_cast<int>(backBuffer.Format),
         static_cast<int>(format), static_cast<int>(imageDescription.Format));
@@ -1649,7 +1671,8 @@ void PoseLagSample(std::uint64_t present, const std::array<float, 16>& view,
 
 }  // namespace
 
-// Rate-limited logging for DIBR fallbacks to the last real eye image.
+// Why a DIBR frame fell back to the last real eye image (rate limited, named like the SnowRunner
+// mod's decline outcomes).
 static void DibrDecline(const char* reason)
 {
     static int counts[8]{};
@@ -1874,7 +1897,8 @@ void OpenXRRuntime::WriteEyeImages(ID3D11Texture2D* frame, int renderedEye, bool
     }
 }
 
-// Present the collected HUD draws on a panel fixed in front of the recenter direction.
+// The HUD as a panel fixed in the room in front of the recentre direction (Tarkov KBM VR,
+// HudLayer): the UI draws of the world view were collected into one texture.
 bool OpenXRRuntime::BuildHudLayer(XrCompositionLayerQuad& hud)
 {
     UINT width = 0;
@@ -1996,6 +2020,7 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
     std::uint32_t layerCount = 0;
     bool submittedSteamVrQuads = false;
     std::uint32_t drawPoseId = 0;
+    float submittedRoll = 0.0F;
 
     if (m_poseRing[0].valid) {
         const XrVector3f forward = Rotate(m_poseRing[0].head.orientation, {0.0F, 0.0F, -1.0F});
@@ -2401,14 +2426,17 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
                     XrQuaternionf cameraRoll{0.0F, 0.0F, 0.0F, 1.0F};
                     if (GetConfig().stabilizeArmaRoll && lensPass == 0) {
                         float roll = 0.0F;
+                        const auto measureRoll =
+                            m_vehicleMode ? CameraRollFromView : OnFootCameraRollFromView;
                         if (sceneProjection.valid) {
-                            roll = CameraRollFromView(sceneProjection.view[4], sceneProjection.view[5]);
+                            roll = measureRoll(sceneProjection.view[4], sceneProjection.view[5]);
                         } else if (m_gameProjectionView) {
                             float matrices[32]{};
                             m_gameProjectionView(matrices);
-                            roll = CameraRollFromView(matrices[20], matrices[21]);
+                            roll = measureRoll(matrices[20], matrices[21]);
                         }
                         cameraRoll = {0.0F, 0.0F, std::sin(roll * 0.5F), std::cos(roll * 0.5F)};
+                        submittedRoll = roll * kDegrees;
                     }
                     XrQuaternionf frameOrientation = orientation;
                     if (regularProjection && renderedEye < 0 && !staleMode &&
@@ -2711,7 +2739,7 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
             }
             ++m_quadFramesSubmitted;
             if (!m_loggedFirstQuad) {
-                Log("OpenXR first quad frame: %ux%u, %.3f x %.3f m at %.2f m (%.1f deg), %s",
+                Log("RUNG3 first quad frame: %ux%u, %.3f x %.3f m at %.2f m (%.1f deg), %s",
                     m_quadWidth, m_quadHeight, quad.size.width, quad.size.height,
                     m_quadDistanceMeters,
                     HorizontalDegrees(m_quadWidthMeters, m_quadDistanceMeters),
@@ -2752,7 +2780,8 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
                                 space == m_viewSpace ? "view" : "other";
         TraceSubmittedFrame(renderedEye, matchedPose, layerCount, projectionViews,
                             result, NowMs() - traceStart, dlssSubmitted, staleWarpSubmitted,
-                            viewKind, viewSpace, projected || submittedSteamVrQuads ? drawPoseId : 0);
+                            viewKind, viewSpace, projected || submittedSteamVrQuads ? drawPoseId : 0,
+                            submittedRoll);
     }
     if (Check(result, "ending frame")) {
         if (rememberStalePair && GetConfig().staleEyeWarp) {
@@ -2762,7 +2791,7 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
             m_renderEye = nextStaleEye;
         }
         if (m_framesSubmitted++ == 0) {
-            Log("OpenXR first xrEndFrame succeeded (layers=%u)", layerCount);
+            Log("RUNG2 first xrEndFrame ok (layers=%u)", layerCount);
         }
     }
     return submittedSteamVrQuads;
@@ -2772,7 +2801,7 @@ void OpenXRRuntime::TraceSubmittedFrame(
     int renderedEye, std::uint32_t matchedPose, std::uint32_t layerCount,
     const XrCompositionLayerProjectionView views[2], XrResult result, double submitMs,
     bool dlssSubmitted, bool staleWarpSubmitted, const char* viewKind, const char* viewSpace,
-    std::uint32_t drawPoseId)
+    std::uint32_t drawPoseId, float submittedRoll)
 {
     if (!m_frameTraceAttempted) {
         m_frameTraceAttempted = true;
@@ -2803,7 +2832,9 @@ void OpenXRRuntime::TraceSubmittedFrame(
             for (int i = 0; i < 16; ++i) {
                 m_frameTrace << ",world_draw_v" << i;
             }
-            m_frameTrace << ",submit_draw_pose_id\n";
+            m_frameTrace << ",submit_draw_pose_id,submit_camera_roll_deg,"
+                            "world_yaw_correction_right_m,world_yaw_correction_up_m,"
+                            "world_yaw_correction_forward_m\n";
             m_frameTrace.precision(12);
         }
     }
@@ -2886,7 +2917,11 @@ void OpenXRRuntime::TraceSubmittedFrame(
             m_frameTrace << element;
         }
     }
-    m_frameTrace << ',' << drawPoseId << '\n';
+    m_frameTrace << ',' << drawPoseId << ',' << submittedRoll;
+    for (float offset : worldCamera.yawOrbitCorrection) {
+        m_frameTrace << ',' << offset;
+    }
+    m_frameTrace << '\n';
     if (m_presents % 60 == 0) {
         m_frameTrace.flush();
     }
@@ -2894,7 +2929,7 @@ void OpenXRRuntime::TraceSubmittedFrame(
 
 // On foot or in a vehicle: a vehicle has a roof, so the head sits lower there. Automatic switch:
 // no first-person weapon drawn for 1.5 s in the world view = vehicle, a weapon again = on foot.
-// Ctrl+Insert overrides (automatic -> on foot -> vehicle -> automatic).
+// The Insert menu can override automatic placement.
 void OpenXRRuntime::UpdateHeadPlacement()
 {
     bool wantVehicle = m_vehicleMode;
@@ -2934,371 +2969,33 @@ void OpenXRRuntime::UpdateHeadPlacement()
     EngineStereoSetVehicle(m_vehicleMode);
 }
 
-void OpenXRRuntime::HandleHotkeys(IDXGISwapChain* swapChain)
+void OpenXRRuntime::HandleHotkeys()
 {
-    if (!GetConfig().tuningHotkeys) {
-        static bool recenterHeld = false;
-        static bool insertHeld = false;
-        static bool escapeHeld = false;
-        const bool recenter = KeyEdge(VK_F11, recenterHeld);
-        const bool insert = KeyEdge(VK_INSERT, insertHeld);
-        const bool escape = KeyEdge(VK_ESCAPE, escapeHeld);
-        if ((!recenter && !insert && !escape) || KeyHeld(VK_CONTROL) || KeyHeld(VK_MENU) ||
-            KeyHeld(VK_SHIFT) || !m_window ||
-            GetAncestor(m_window, GA_ROOT) != GetAncestor(GetForegroundWindow(), GA_ROOT)) {
-            return;
-        }
-        if (insert) {
-            if (!Menu::Instance().IsOpen()) {
-                PlaceMenu();
-            }
-            Menu::Instance().Toggle();
-        } else if (escape && Menu::Instance().IsOpen()) {
-            Menu::Instance().SetOpen(false);
-        }
-        if (recenter) {
-            m_headRecenterRequested = true;
-            m_recenterRequested = true;
-            EngineStereoResetZoomReference();
-            Log("Recentre requested (F11)");
-        }
+    static bool recenterHeld = false;
+    static bool insertHeld = false;
+    static bool escapeHeld = false;
+    const bool recenter = KeyEdge(VK_F11, recenterHeld);
+    const bool insert = KeyEdge(VK_INSERT, insertHeld);
+    const bool escape = KeyEdge(VK_ESCAPE, escapeHeld);
+    if ((!recenter && !insert && !escape) || KeyHeld(VK_CONTROL) || KeyHeld(VK_MENU) ||
+        KeyHeld(VK_SHIFT) || !m_window ||
+        GetAncestor(m_window, GA_ROOT) != GetAncestor(GetForegroundWindow(), GA_ROOT)) {
         return;
     }
-    // Optional tuning shortcuts. In world view these keys tune the HUD:
-    //   Ctrl+Left/Right smaller/bigger, Ctrl+Up/Down higher/lower,
-    //   Shift+Left/Right left/right,    Shift+Up/Down farther/closer.
-    // Alt: Left/Right depth strength, Up/Down screen plane, PgUp/PgDn picture crop,
-    // Home/End pose lag. Read every key so presses in other apps do not queue up.
-    const bool del = KeyPressed(VK_DELETE);
-    static bool insertWasDown = false;
-    static bool escapeWasDown = false;
-    const bool insertKey = KeyEdge(VK_INSERT, insertWasDown);
-    const bool escapeKey = KeyEdge(VK_ESCAPE, escapeWasDown);
-    static bool browseUpWasDown = false;
-    static bool browseDownWasDown = false;
-    static bool browseDelWasDown = false;
-    static bool browseToggleWasDown = false;
-    const bool browseUpEdge = KeyEdge(VK_PRIOR, browseUpWasDown);
-    const bool browseDownEdge = KeyEdge(VK_NEXT, browseDownWasDown);
-    const bool browseDelEdge = KeyEdge(VK_DELETE, browseDelWasDown);
-    const bool browseToggleEdge = KeyEdge(VK_F1, browseToggleWasDown);
-    const bool f12 = KeyPressed(VK_F12);
-    const bool f11 = KeyPressed(VK_F11);
-    const bool f10 = KeyPressed(VK_F10);
-    const bool f9 = KeyPressed(VK_F9);
-    const bool left = KeyPressed(VK_LEFT);
-    const bool right = KeyPressed(VK_RIGHT);
-    const bool up = KeyPressed(VK_UP);
-    const bool down = KeyPressed(VK_DOWN);
-    const bool pageUp = KeyPressed(VK_PRIOR);
-    const bool pageDown = KeyPressed(VK_NEXT);
-    const bool home = KeyPressed(VK_HOME);
-    const bool end = KeyPressed(VK_END);
-    const bool f8 = KeyPressed(VK_F8);
-    const bool f5 = KeyPressed(VK_F5);
-    const bool f6 = KeyPressed(VK_F6);
-    const bool f7 = KeyPressed(VK_F7);
-    const bool f3 = KeyPressed(VK_F3);
-    const bool f4 = KeyPressed(VK_F4);
-    const bool ctrl = KeyHeld(VK_CONTROL);
-    const bool alt = KeyHeld(VK_MENU);
-    const bool shift = KeyHeld(VK_SHIFT);
-    const bool worldMode = m_worldViewState == 1;
-    const bool ctrlMode = ctrl && !alt;
-    const bool altMode = alt && !ctrl;
-    const bool toggleStaleEye = ctrl && alt && !shift && f12;
-    const bool toggleWorldVrs = ctrl && alt && !shift && f8;
-    const bool toggleStereoShadows = ctrl && alt && !shift && f7;
-    const bool shiftMode = shift && !ctrl && !alt;
-    const bool arrows = left || right || up || down;
-    const bool plainRecentre = f11 && !ctrl && !alt;
-    const bool plainInsert = insertKey && !ctrl && !alt && !shift;
-    const bool menuEscape = escapeKey && Menu::Instance().IsOpen();
-    // Shader browser: Ctrl+F1 on/off; while on, plain PgUp/PgDn step and Del marks the shader.
-    const bool plainKeys = !ctrl && !alt && !shift;
-    const bool browseOn = ShaderBrowseEnabled();
-    const bool browseToggle = browseToggleEdge && ctrlMode;
-    const bool browseStep = browseOn && plainKeys && (browseUpEdge || browseDownEdge);
-    const bool browseMark = browseOn && plainKeys && browseDelEdge;
-    const bool ctrlKeys = arrows || pageUp || pageDown || del || f11 || f10 || f9 || f8 || f5 ||
-                          f6 || f7 || f3 || f4 || f12 || insertKey;
-    const bool altKeys = arrows || pageUp || pageDown || home || end;
-    if (!toggleStaleEye && !toggleWorldVrs && !toggleStereoShadows &&
-        !plainRecentre && !plainInsert && !menuEscape && !browseToggle && !browseStep &&
-        !browseMark && !(ctrlMode && ctrlKeys) &&
-        !(altMode && altKeys) &&
-        !(shiftMode && arrows && worldMode)) {
-        return;
-    }
-    DXGI_SWAP_CHAIN_DESC description{};
-    if (FAILED(swapChain->GetDesc(&description)) ||
-        GetAncestor(description.OutputWindow, GA_ROOT) !=
-            GetAncestor(GetForegroundWindow(), GA_ROOT)) {
-        Log("TUNING ignored: game window is not in the foreground");
-        return;
-    }
-    if (browseToggle) {
-        // Ctrl+F1 cycles: off -> screen-space shaders -> UI draws (icons, markers) -> off.
-        if (ShaderBrowseMode() == 0) {
-            PlaceMenu();
-        }
-        ShaderBrowseSetMode((ShaderBrowseMode() + 1) % 3);
-    }
-    if (browseStep) {
-        ShaderBrowseStep(browseDownEdge ? 1 : -1);
-    }
-    if (browseMark) {
-        ShaderBrowseMark();
-    }
-    if (plainInsert) {
+    if (insert) {
         if (!Menu::Instance().IsOpen()) {
             PlaceMenu();
         }
         Menu::Instance().Toggle();
-    } else if (menuEscape) {
+    } else if (escape && Menu::Instance().IsOpen()) {
         Menu::Instance().SetOpen(false);
     }
-    if (ctrlMode && insertKey) {
-        m_vehicleForce = GetConfig().vehicleAuto ? (m_vehicleForce + 1) % 3
-                                                 : (m_vehicleForce == 2 ? 1 : 2);
-        Log("HEAD placement mode: %s (Ctrl+Insert)",
-            m_vehicleForce == 0 ? "automatic" : (m_vehicleForce == 1 ? "on foot" : "vehicle"));
-    }
-    if (ctrlMode && f12 && shift && GetConfig().cacheStereoProjection) {
-        const bool enabled = EngineProjectionCache().Toggle();
-        Log("STEREO projection cache %s (Ctrl+Shift+F12), present %llu",
-            enabled ? "on" : "off", static_cast<unsigned long long>(m_presents));
-        return;
-    }
-    if (toggleStaleEye) {
-        SetFrameMode(GetConfig().staleEyeWarp ? FrameMode::FullStereo : FrameMode::StaleEye);
-        return;
-    }
-    if (toggleWorldVrs) {
-        auto& enabled = MutableConfig().worldVrs;
-        enabled = !enabled;
-        Log("World VRS %s (Ctrl+Alt+F8), present %llu", enabled ? "on" : "off",
-            static_cast<unsigned long long>(m_presents));
-        return;
-    }
-    if (toggleStereoShadows) {
-        auto& enabled = MutableConfig().stereoShadows;
-        enabled = !enabled;
-        Log("Stereo shadow resolve %s (Ctrl+Alt+F7), present %llu", enabled ? "on" : "off",
-            static_cast<unsigned long long>(m_presents));
-        return;
-    }
-    if (ctrlMode && f12) {
-        if (GetConfig().staleEyeWarp) {
-            SetFrameMode(FrameMode::FullStereo);
-            return;
-        }
-        MutableConfig().dibrForwardHistory = false;
-        if (!m_alternateEyeProjection) {
-            m_alternateEyeProjection = true;
-            m_dibrShift = false;
-        } else if (!m_dibrShift) {
-            m_dibrShift = true;
-        } else {
-            m_alternateEyeProjection = false;
-            m_dibrShift = false;
-        }
-        m_renderEye = -1;
-        m_dibr.ResetHistory();
-        Log("RENDER mode: %s", !m_alternateEyeProjection ? "same-frame stereo" :
-            (m_dibrShift ? "AER + DIBR" : "AER"));
-    }
-    if (plainRecentre) {
+    if (recenter) {
         m_headRecenterRequested = true;
         m_recenterRequested = true;
         EngineStereoResetZoomReference();
         Log("Recentre requested (F11)");
     }
-    const auto logHud = [this]() {
-        Log("TUNING HUD scale=%.2f shift x=%+.2f y=%+.2f distance=%.1f m", m_hudScale,
-            m_hudShiftX, m_hudShiftY, m_hudDistance);
-    };
-    if (shiftMode) {
-        if (left || right) {
-            m_hudShiftX = std::clamp(m_hudShiftX + (right ? 0.02F : -0.02F), -0.6F, 0.6F);
-        }
-        if (up || down) {
-            m_hudDistance = std::clamp(m_hudDistance + (up ? 0.1F : -0.1F), 0.4F, 10.0F);
-        }
-        logHud();
-        return;
-    }
-    if (altMode && shift && (arrows || pageUp || pageDown)) {
-        // Alt+Shift: the first-person weapon: Left/Right depth, Up/Down zero-parallax distance
-        // (window mode), PgUp/PgDn size.
-        if (pageUp || pageDown) {
-            m_weaponSize = std::clamp(m_weaponSize + (pageUp ? 0.05F : -0.05F), 0.2F, 1.5F);
-        }
-        if (left || right) {
-            m_weaponScale = std::clamp(m_weaponScale + (right ? 0.05F : -0.05F), 0.0F, 2.0F);
-        }
-        if (up || down) {
-            m_weaponConvergence =
-                std::clamp(up ? m_weaponConvergence * 1.15F : m_weaponConvergence / 1.15F, 0.2F, 5.0F);
-        }
-        Log("TUNING weapon depth scale=%.2f size=%.2f zero-parallax distance=%.2f m "
-            "(Alt+Shift+Arrows, PgUp/PgDn)",
-            m_weaponScale, m_weaponSize, m_weaponConvergence);
-        return;
-    }
-    if (altMode) {
-        if (left || right) {
-            const float step = 0.1F;
-            m_stereoScale = std::clamp(m_stereoScale + (right ? step : -step), 0.0F, 3.0F);
-            Log("TUNING stereo depth scale=%.2f (Alt+Left/Right)", m_stereoScale);
-        }
-        if (up || down) {
-            const float factor = 1.15F;
-            m_convergenceMeters =
-                std::clamp(up ? m_convergenceMeters * factor : m_convergenceMeters / factor, 0.05F,
-                           20.0F);
-            Log("TUNING screen plane factor=%.2f (Alt+Up/Down)", m_convergenceMeters);
-        }
-        if (pageUp || pageDown) {
-            m_fovCrop = std::clamp(m_fovCrop + (pageUp ? 0.05F : -0.05F), 0.4F, 1.0F);
-            Log("TUNING picture crop=%.2f of the game field of view (Alt+PgUp/PgDn)", m_fovCrop);
-        }
-        if (home || end) {
-            m_poseLag = std::clamp(m_poseLag + (end ? 1 : -1), 1, 4);
-            Log("TUNING pose lag=%d frames (Alt+Home/End)", m_poseLag);
-        }
-        return;
-    }
-    if (worldMode && (arrows || pageUp || pageDown)) {
-        if (shift) {
-            // Ctrl+Shift+arrows: HUD size and height.
-            if (left || right) {
-                m_hudScale = std::clamp(m_hudScale + (right ? 0.05F : -0.05F), 0.2F, 1.2F);
-            }
-            if (up || down) {
-                m_hudShiftY = std::clamp(m_hudShiftY + (up ? 0.02F : -0.02F), -0.6F, 0.6F);
-            }
-            logHud();
-        } else {
-            // Ctrl+arrows: place the head against the game camera (and the weapon): Left/Right
-            // sideways, Up/Down forward/back, PgUp/PgDn up/down, 1 cm per press.
-            if (left || right) {
-                m_headOffset[0] = std::clamp(m_headOffset[0] + (right ? 0.01F : -0.01F), -0.6F, 0.6F);
-            }
-            if (up || down) {
-                m_headOffset[2] = std::clamp(m_headOffset[2] + (up ? 0.01F : -0.01F), -0.6F, 0.6F);
-            }
-            if (pageUp || pageDown) {
-                m_headOffset[1] = std::clamp(m_headOffset[1] + (pageUp ? 0.01F : -0.01F), -0.6F, 0.6F);
-            }
-            Log("TUNING head placement right=%+.2f up=%+.2f forward=%+.2f m (Ctrl+arrows, PgUp/PgDn; "
-                "Ctrl+Delete saves)",
-                m_headOffset[0], m_headOffset[1], m_headOffset[2]);
-        }
-    }
-    const float step = shift ? 0.25F : 0.05F;
-    bool screenChanged = false;
-    if (!worldMode && (left || right)) {
-        m_quadWidthMeters = ClampQuadWidth(m_quadWidthMeters + (right ? step : -step));
-        screenChanged = true;
-    }
-    if (!worldMode && (up || down)) {
-        m_quadDistanceMeters = ClampQuadDistance(m_quadDistanceMeters + (up ? step : -step));
-        screenChanged = true;
-        m_recenterRequested = true;
-    }
-    if (!worldMode && (pageUp || pageDown)) {
-        m_quadHeightMeters = std::clamp(m_quadHeightMeters + (pageUp ? step : -step), -1.5F, 1.5F);
-        screenChanged = true;
-        m_recenterRequested = true;
-    }
-    if (screenChanged) {
-        Log("TUNING screen width=%.2f m distance=%.2f m height=%+.2f m (%.1f deg horizontal)",
-            m_quadWidthMeters, m_quadDistanceMeters, m_quadHeightMeters,
-            HorizontalDegrees(m_quadWidthMeters, m_quadDistanceMeters));
-    }
-    if (f9) {
-        m_stereoEnabled = !m_stereoEnabled;
-        Log("STEREO %s (Ctrl+F9)", m_stereoEnabled ? "on" : "off, mono");
-    }
-    if (f8 && GetConfig().headTracking) {
-        m_calibrationTried = true;
-        m_headRecenterRequested = true;
-        m_recenterRequested = true;
-        m_calibration.Start();
-    }
-    if (f6) {
-        m_hudLockOn = !m_hudLockOn;
-        EngineStereoSetHudLock(m_hudLockOn);
-        Log("TUNING HUD stays with the body: %s (Ctrl+F6)", m_hudLockOn ? "on" : "off");
-    }
-    if (f4) {
-        m_projectionEnabled = !m_projectionEnabled;
-        Log("PROJECTION layer %s (Ctrl+F4): %s", m_projectionEnabled ? "on" : "off",
-            m_projectionEnabled ? "immersive world view" : "game screen");
-    }
-    if (f3) {
-        m_sbsInput = !m_sbsInput;
-        Log("SBS input %s (Ctrl+F3)", m_sbsInput ? "on: halves go to the eyes" : "off");
-    }
-    if (f7) {
-        m_headPositionOn = !m_headPositionOn;
-        Log("TUNING head position (lean): %s (Ctrl+F7)", m_headPositionOn ? "on" : "off");
-    }
-    if (f5) {
-        m_weaponLockOn = !m_weaponLockOn;
-        Log("TUNING weapon stays with the body: %s (Ctrl+F5)", m_weaponLockOn ? "on" : "off");
-    }
-    if (f10) {
-        m_worldViewEnabled = !m_worldViewEnabled;
-        Log("World view %s (Ctrl+F10)", m_worldViewEnabled ? "on" : "off, screen only");
-    }
-    if (f11) {
-        m_headRecenterRequested = true;
-        m_recenterRequested = true;
-        Log("Recentre requested (Ctrl+F11)");
-    }
-    if (del) {
-        SaveAllSettings();
-    }
-}
-
-void OpenXRRuntime::SetFrameMode(FrameMode mode)
-{
-    auto& config = MutableConfig();
-    if (mode == FrameMode::StaleEye) {
-        config.aerWarpMode = AerWarpMode::Camera6DoF;
-    } else if (mode == FrameMode::NativeAer && config.aerWarpMode == AerWarpMode::Camera6DoF) {
-        config.aerWarpMode = AerWarpMode::CameraRotation;
-    }
-    config.staleEyeWarp = mode == FrameMode::StaleEye;
-    config.aerNative = mode == FrameMode::NativeAer;
-    config.dibrForwardHistory = mode == FrameMode::DibrForward;
-    m_dibrShift = mode == FrameMode::Dibr || config.dibrForwardHistory;
-    m_alternateEyeProjection = config.aerNative || m_dibrShift;
-    if (mode != FrameMode::FullStereo) {
-        config.aerDibrPreference = config.dibrForwardHistory ? 2 : m_dibrShift ? 1 : 0;
-    }
-    m_renderEye = -1;
-    m_stalePairValid = false;
-    m_staleReported = false;
-    m_staleFallbacks = 0;
-    m_dibrReported = false;
-    m_retainedViews[0] = {};
-    m_retainedViews[1] = {};
-    m_staleEye.ResetHistory();
-    m_dibr.ResetHistory();
-    m_dlssWorld.ResetHistory();
-    const char* name = "same-frame stereo";
-    switch (mode) {
-        case FrameMode::FullStereo: break;
-        case FrameMode::StaleEye: name = "AER + stale-eye 6DoF"; break;
-        case FrameMode::NativeAer: name = "one eye per frame (native)"; break;
-        case FrameMode::Dibr: name = "AER + DIBR"; break;
-        case FrameMode::DibrForward: name = "DIBR + forward 6DoF history"; break;
-    }
-    Log("RENDER mode: %s (present %llu), AER warp=%d", name,
-        static_cast<unsigned long long>(m_presents), static_cast<int>(config.aerWarpMode));
 }
 
 void OpenXRRuntime::LogStats()
@@ -3456,9 +3153,7 @@ bool OpenXRRuntime::OnPresent(IDXGISwapChain* swapChain)
         m_alternateEyeProjection = GetConfig().alternateEyeProjection;
         m_dibrShift = GetConfig().dibrShift;
         m_dibrFill = GetConfig().dibrFillMode;
-        Log("RENDER startup: stale-eye 6DoF=%d, legacy AER=%d, DLSS Balanced=%d, DIBR=%d",
-            GetConfig().staleEyeWarp, m_alternateEyeProjection, GetConfig().dlssBalancedExperimental,
-            m_dibrShift);
+        Log("RENDER startup: full stereo locked");
         m_weaponScale = GetConfig().weaponScale;
         m_weaponConvergence = GetConfig().weaponConvergenceMeters;
         m_weaponSize = GetConfig().weaponSize;
@@ -3478,8 +3173,7 @@ bool OpenXRRuntime::OnPresent(IDXGISwapChain* swapChain)
         m_stereoSwap = GetConfig().stereoSwapEyes;
         m_tuningInitialized = true;
     }
-    // Engine stereo keeps drawing both halves; "off" (Ctrl+F9) and menus only remove
-    // the parallax, because the headset side always splits the picture in halves.
+    // The stereo buffer keeps both eye regions. Menus use matching views without parallax.
     EngineStereoSetTuning(true, WindowsCursorShowing() || !m_stereoEnabled, m_stereoScale,
                           m_convergenceMeters);
     EngineStereoSetHud(m_worldViewState == 1 && m_sbsInput, m_hudScale, m_hudShiftX, m_hudShiftY,
@@ -3501,6 +3195,9 @@ bool OpenXRRuntime::OnPresent(IDXGISwapChain* swapChain)
     PollEvents();
     if (!m_sessionRunning) {
         return false;
+    }
+    if (m_framePrepared) {
+        ApplyLocalSpaceChanges();
     }
     const int mode = GetConfig().openXrDiagnosticMode;
     if (mode == 2) {
@@ -3529,7 +3226,7 @@ bool OpenXRRuntime::OnPresent(IDXGISwapChain* swapChain)
     m_submitMsSum += submitMs;
     PerfAddPresentSide(0.0, 0.0, submitMs);
     if (!deferWait) {
-        PrepareFollowingFrame(swapChain);
+        PrepareFollowingFrame();
     }
     return deferWait;
 }
@@ -3550,31 +3247,18 @@ void OpenXRRuntime::OnAfterPresent(IDXGISwapChain* swapChain, double desktopPres
     m_steamVrDesktopPresentSum += desktopPresentMs;
     m_steamVrDesktopPresentMax = std::max(m_steamVrDesktopPresentMax, desktopPresentMs);
     m_steamVrDesktopSyncInterval = syncInterval;
-    PrepareFollowingFrame(swapChain);
+    PrepareFollowingFrame();
 }
 
-void OpenXRRuntime::PrepareFollowingFrame(IDXGISwapChain* swapChain)
+void OpenXRRuntime::PrepareFollowingFrame()
 {
-    if (m_pendingFrameMode) {
-        MutableConfig().aerWarpMode = m_pendingFrameMode->warp;
-        SetFrameMode(m_pendingFrameMode->mode);
-        m_pendingFrameMode.reset();
-    }
     PrepareNextFrame();
-    HandleHotkeys(swapChain);
+    HandleHotkeys();
     const auto& config = GetConfig();
     EngineStereoSetDesktopHudMirror(!m_steamVr || !config.steamVrWorldQuad || config.steamVrMirrorHud);
-    const bool staleMode = config.staleEyeWarp;
-    const bool alternateEyes = !staleMode && m_alternateEyeProjection;
-    if (!m_poseRing[0].projection || m_headRecenterRequested || !m_projectionEnabled ||
-        !m_sbsInput || !m_stereoEnabled || m_recenterRequested ||
-        ((staleMode || alternateEyes) &&
-         (m_poseRing[0].sightActive || EngineStereoScopeUi() || m_poseRing[0].scopeStatic)) ||
-        (alternateEyes && m_dibrShift && std::fabs(EngineStereoDrawZoom() - 1.0F) > 0.001F)) {
-        m_renderEye = -1;
-    }
-    EngineStereoSetRenderEye(m_renderEye, m_dibrShift || staleMode);
-    EngineStereoSetAerNative(!staleMode && GetConfig().aerNative && m_alternateEyeProjection && !m_dibrShift);
+    m_renderEye = -1;
+    EngineStereoSetRenderEye(-1);
+    EngineStereoSetAerNative(false);
     EngineStereoSetMonoScreen(GetConfig().monoScreen && WindowsCursorShowing());
     EngineStereoSetVirtualBack(GetConfig().virtualBackBuffer && GetConfig().monoScreen &&
                                m_projectionEnabled && m_sbsInput && m_poseRing[0].projection);

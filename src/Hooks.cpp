@@ -86,7 +86,7 @@ void PerfAfterPresent(IDXGISwapChain* swapChain)
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
 {
     if (!g_loggedPresent.exchange(true)) {
-        Log("DXGI first IDXGISwapChain::Present: swapchain=%p sync=%u flags=0x%X thread=%lu",
+        Log("RUNG1 first IDXGISwapChain::Present: swapchain=%p sync=%u flags=0x%X thread=%lu",
             swapChain, syncInterval, flags, GetCurrentThreadId());
     }
     const double perfT0 = PerfNowMs();
@@ -120,7 +120,7 @@ HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swapChain, UINT syncInte
                                        UINT flags, const DXGI_PRESENT_PARAMETERS* parameters)
 {
     if (!g_loggedPresent1.exchange(true)) {
-        Log("DXGI first IDXGISwapChain1::Present1: swapchain=%p thread=%lu", swapChain,
+        Log("RUNG1 first IDXGISwapChain1::Present1: swapchain=%p thread=%lu", swapChain,
             GetCurrentThreadId());
     }
     const double perfT0 = PerfNowMs();

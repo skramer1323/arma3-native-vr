@@ -1,5 +1,4 @@
-// Adapted from SnowRunner VR (MIT). See licenses/SnowRunner-VR-LICENSE.txt.
-// Make the game's main window
+// Port of the SnowRunner VR mod's resolution hook (MIT-style lab use): make the game's main window
 // exactly the headset's per-eye resolution, so the game renders one eye per frame at 1:1 pixels.
 
 #include "ResolutionHook.h"

@@ -1,4 +1,4 @@
-// Settings menu (Insert): the widgets and the panel that shows them in the headset.
+﻿// Settings menu (Insert): the widgets and the panel that shows them in the headset.
 // Members of OpenXRRuntime, kept in their own file so OpenXRRuntime.cpp does not grow further.
 
 #include "OpenXRRuntime.h"
@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <vector>
 #include <string>
 
 namespace a3vr {
@@ -27,6 +29,28 @@ constexpr std::uint32_t kMenuHeight = 960;
 constexpr float kMenuDistanceMeters = 1.3F;
 constexpr float kMenuWidthMeters = 1.6F;
 
+}  // namespace
+
+
+namespace {
+
+std::string Base64(const std::vector<std::uint8_t>& bytes)
+{
+    static const char* kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    for (std::size_t i = 0; i < bytes.size(); i += 3) {
+        const std::uint32_t chunk = (static_cast<std::uint32_t>(bytes[i]) << 16) |
+                                    (i + 1 < bytes.size() ? bytes[i + 1] << 8 : 0) |
+                                    (i + 2 < bytes.size() ? bytes[i + 2] : 0);
+        out += kAlphabet[(chunk >> 18) & 63];
+        out += kAlphabet[(chunk >> 12) & 63];
+        out += i + 1 < bytes.size() ? kAlphabet[(chunk >> 6) & 63] : '=';
+        out += i + 2 < bytes.size() ? kAlphabet[chunk & 63] : '=';
+    }
+    return out;
+}
+
 // Arma rewrites Arma3.cfg at exit. Persist the new 3D extent afterwards, and include
 // the window size only in the legacy path where the headset uses that back buffer.
 bool ScheduleCfgResolution(int width, int height, bool resizeWindow)
@@ -36,21 +60,19 @@ bool ScheduleCfgResolution(int width, int height, bool resizeWindow)
     wchar_t script[1400];
     swprintf_s(script, kScriptFormat, GetCurrentProcessId(), resizeWindow ? L"$true" : L"$false",
                width, height, width, height);
-    wchar_t systemDirectory[MAX_PATH]{};
-    const UINT directoryLength = GetSystemDirectoryW(systemDirectory, MAX_PATH);
-    if (directoryLength == 0 || directoryLength >= MAX_PATH) {
-        Log("RESOLUTION could not locate the Windows system directory");
-        return false;
-    }
-    const std::wstring powershell = std::wstring(systemDirectory) +
-        LR"(\WindowsPowerShell\v1.0\powershell.exe)";
-    std::wstring command = L"\"" + powershell + L"\" -NoProfile -NonInteractive -Command \"" +
-        script + L"\"";
+    const std::size_t length = wcslen(script) * sizeof(wchar_t);
+    std::vector<std::uint8_t> bytes(length);
+    std::memcpy(bytes.data(), script, length);
+    const std::string encoded = Base64(bytes);
+    std::wstring command =
+        L"powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass "
+        L"-EncodedCommand ";
+    command.append(encoded.begin(), encoded.end());
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(powershell.c_str(), command.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &startup, &process)) {
         Log("RESOLUTION could not start the helper that edits Arma3.cfg (error %lu)",
             GetLastError());
         return false;
@@ -220,10 +242,10 @@ void OpenXRRuntime::DrawMenuUi()
             ImGuiWindowFlags_NoInputs;
         if (ImGui::Begin("a3vr_shaders", nullptr, overlayFlags)) {
             ImGui::TextUnformatted(ShaderBrowseMode() == 2
-                                       ? "HUD icons: PgUp/PgDn to hide a different shader, Del to mark it"
-                                       : "Shaders: PgUp/PgDn to hide a different shader, Del to mark it");
+                                       ? "HUD icons: PgUp/PgDn to hide a draw, Del to mark"
+                                       : "Shaders: PgUp/PgDn to hide a draw, Del to mark");
             ImGui::TextUnformatted(ShaderBrowseDescribe().c_str());
-            ImGui::Text("Marked: %zu    Ctrl+F1 cycles shaders, HUD icons and off",
+            ImGui::Text("Marked: %zu    Ctrl+F1 cycles shader, HUD and off",
                         ShaderBrowseMarkedLines().size());
         }
         ImGui::End();
@@ -241,7 +263,7 @@ void OpenXRRuntime::DrawMenuUi()
     Config& config = MutableConfig();
     ImGui::TextUnformatted("Arma 3 VR Settings");
     ImGui::SameLine(0.0F, 30.0F);
-    ImGui::TextDisabled("Close with Insert or Esc. The mouse controls the menu while it is open.");
+    ImGui::TextDisabled("Insert or Esc closes settings.");
     if (ImGui::Button("Recenter view (F11)")) {
         m_headRecenterRequested = true;
         m_recenterRequested = true;
@@ -259,28 +281,25 @@ void OpenXRRuntime::DrawMenuUi()
                 m_vehicleForce = 1;
             }
             ImGui::SameLine();
-            if (ImGui::Button("In vehicle")) {
+            if (ImGui::Button("Vehicle")) {
                 m_vehicleForce = 2;
             }
             ImGui::SameLine();
-            if (config.tuningHotkeys) {
-                ImGui::TextDisabled("Ctrl+Insert cycles head placement.");
-            }
-            ImGui::SliderInt("Head pose offset (frames)", &m_poseLag, 1, 4);
+            ImGui::SliderInt("Head pose delay (frames)", &m_poseLag, 1, 4);
             if (ImGui::Checkbox("Stabilize horizon", &config.stabilizeArmaRoll)) {
                 m_renderEye = -1;
                 m_dibr.ResetHistory();
                 Log("Camera roll stabilization %s", config.stabilizeArmaRoll ? "on" : "off");
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Compensates for in-game camera roll, including in vehicles and while aiming.");
+                ImGui::SetTooltip("Compensates for the game camera roll, including while aiming or in vehicles.");
             }
             ImGui::SliderFloat("Right (m)", &m_headOffset[0], -0.3F, 0.3F, "%.2f");
             ImGui::SliderFloat("Up (m)", &m_headOffset[1], -0.3F, 0.3F, "%.2f");
             ImGui::SliderFloat("Forward (m)", &m_headOffset[2], -0.3F, 0.3F, "%.2f");
             ImGui::Checkbox("Positional head tracking (6DoF)", &m_headPositionOn);
-            ImGui::Checkbox("Keep weapon aligned with the body", &m_weaponLockOn);
-            if (ImGui::Checkbox("Inspect weapon by leaning", &config.weaponHeadPosition)) {
+            ImGui::Checkbox("Keep weapon aligned with body", &m_weaponLockOn);
+            if (ImGui::Checkbox("Lean to inspect weapon", &config.weaponHeadPosition)) {
                 if (config.weaponHeadPosition) {
                     m_headPositionOn = true;
                 }
@@ -288,61 +307,58 @@ void OpenXRRuntime::DrawMenuUi()
                 m_dibr.ResetHistory();
                 Log("WEAPON inspection mode %s", config.weaponHeadPosition ? "on" : "off");
             }
-            if (config.weaponHeadPosition && m_alternateEyeProjection && !config.staleEyeWarp) {
-                ImGui::TextDisabled("Weapon inspection is paused in alternate-eye rendering.");
-            } else if (config.weaponHeadPosition) {
-                ImGui::TextDisabled("Available on foot in full stereo while not aiming.");
+            if (config.weaponHeadPosition) {
+                ImGui::TextDisabled("Available on foot at normal zoom in full stereo.");
             }
             ImGui::Checkbox("Hide torso and vest (experimental)", &config.firstPersonHideTorso);
-            ImGui::SliderFloat("Equipment clipping distance (cm)", &config.firstPersonClipCm,
+            ImGui::SliderFloat("Near body clipping (cm)", &config.firstPersonClipCm,
                                0.0F, 18.0F, "%.0f");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("HUD")) {
-            ImGui::Checkbox("Hide in-mission HUD", &config.hideGameplayHud);
-            ImGui::Checkbox("World-locked HUD panel", &m_hudLockOn);
-            ImGui::Checkbox("Center marked HUD element", &config.stabilizeHudMarker);
+            ImGui::Checkbox("Hide gameplay HUD", &config.hideGameplayHud);
+            ImGui::Checkbox("Room-anchored HUD panel", &m_hudLockOn);
+            ImGui::Checkbox("Center the marked HUD element", &config.stabilizeHudMarker);
             ImGui::SliderFloat("Size", &m_hudScale, 0.2F, 1.2F, "%.2f");
             ImGui::SliderFloat("Horizontal offset", &m_hudShiftX, -0.6F, 0.6F, "%.2f");
             ImGui::SliderFloat("Vertical offset", &m_hudShiftY, -0.6F, 0.6F, "%.2f");
             ImGui::SliderFloat("Distance (m)", &m_hudDistance, 0.4F, 6.0F, "%.2f");
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Weapons and optics")) {
+        if (ImGui::BeginTabItem("Weapon and optics")) {
             ImGui::SliderFloat("Weapon size", &m_weaponSize, 0.2F, 1.5F, "%.2f");
-            ImGui::SliderFloat("Weapon depth", &m_weaponScale, 0.0F, 2.0F, "%.2f");
-            ImGui::SliderFloat("Zero-parallax distance (m)", &m_weaponConvergence, 0.2F, 5.0F,
+            ImGui::SliderFloat("Weapon stereo depth", &m_weaponScale, 0.0F, 2.0F, "%.2f");
+            ImGui::SliderFloat("Zero parallax distance (m)", &m_weaponConvergence, 0.2F, 5.0F,
                                "%.2f");
             ImGui::Separator();
-            ImGui::Checkbox("Magnified scope window", &config.scopeLens);
-            ImGui::SliderFloat("Scope window size (degrees)", &config.scopeLensDegrees, 8.0F, 70.0F,
+            ImGui::Checkbox("Magnified optic window", &config.scopeLens);
+            ImGui::SliderFloat("Optic window size (degrees)", &config.scopeLensDegrees, 8.0F, 70.0F,
                                "%.0f");
-            ImGui::Checkbox("Weapon-aligned reticle (follows the mouse)", &config.scopeReticle);
-            ImGui::Checkbox("Lock scope view to mouse aim",
+            ImGui::Checkbox("Weapon-aligned optic reticle", &config.scopeReticle);
+            ImGui::Checkbox("Use mouse aim through magnified optics",
                             &config.scopeStatic);
-            ImGui::Checkbox("Center the weapon in both eyes while scoped",
+            ImGui::Checkbox("Center the weapon in both eyes when scoped",
                             &config.scopeWeaponFlat);
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Image")) {
-            ImGui::SliderFloat("Stereo strength", &m_stereoScale, 0.0F, 3.0F, "%.2f");
-            ImGui::SliderFloat("Screen crop", &m_fovCrop, 0.4F, 1.0F, "%.2f");
-            ImGui::Checkbox("Enable stereo", &m_stereoEnabled);
+            ImGui::SliderFloat("Stereo depth", &m_stereoScale, 0.0F, 3.0F, "%.2f");
+            ImGui::SliderFloat("Virtual screen crop", &m_fovCrop, 0.4F, 1.0F, "%.2f");
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Shaders")) {
+        if (GetConfig().frameProbe && ImGui::BeginTabItem("Shaders")) {
             int browseMode = ShaderBrowseMode();
             const int browseBefore = browseMode;
             ImGui::RadioButton("Off", &browseMode, 0);
-            ImGui::RadioButton("Screen-space shaders (shadows, lighting, bloom)", &browseMode, 1);
-            ImGui::RadioButton("HUD icons and unit markers", &browseMode, 2);
+            ImGui::RadioButton("Screen-space shaders (shadows, light, glow)", &browseMode, 1);
+            ImGui::RadioButton("HUD icons and squad markers", &browseMode, 2);
             if (browseMode != browseBefore) {
                 ShaderBrowseSetMode(browseMode);
             }
-            ImGui::TextDisabled("Ctrl+F1 cycles modes.");
-            ImGui::TextWrapped("Close the menu. PgUp/PgDn cycles screen-space shaders and hides "
-                               "the selected effect. If you find a shadow or lighting issue, "
-                               "press Del to mark the shader in "
+            ImGui::TextDisabled("Ctrl+F1 cycles through the modes.");
+            ImGui::TextWrapped("Close settings. PgUp/PgDn skips the selected screen-space shader "
+                               "so you can see which effect it draws. When you find a broken effect, "
+                               "press Del to record the shader in "
                                "arma3_native_vr.shaders.txt.");
             if (ImGui::Button("Previous")) {
                 ShaderBrowseStep(-1);
@@ -357,53 +373,14 @@ void OpenXRRuntime::DrawMenuUi()
             }
             ImGui::TextUnformatted(ShaderBrowseDescribe().c_str());
             ImGui::Separator();
-            ImGui::TextUnformatted("Marked shaders:");
+            ImGui::TextUnformatted("Marked shaders");
             for (const std::string& line : ShaderBrowseMarkedLines()) {
                 ImGui::BulletText("%s", line.c_str());
             }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Rendering")) {
-            Config& frameConfig = MutableConfig();
-            const char* methods[]{"Full stereo", "AER (one eye per frame)"};
-            int method = frameConfig.staleEyeWarp || m_alternateEyeProjection ? 1 : 0;
-            bool changed = ImGui::Combo("Render method", &method, methods, IM_ARRAYSIZE(methods));
-            int warp = static_cast<int>(frameConfig.staleEyeWarp
-                ? AerWarpMode::Camera6DoF : frameConfig.aerWarpMode);
-            int shift = m_dibrShift ? (frameConfig.dibrForwardHistory ? 2 : 1)
-                : changed ? frameConfig.aerDibrPreference : 0;
-            if (method == 1) {
-                const char* warps[]{"Off", "Headset rotation", "Headset and camera rotation", "Camera 6DoF"};
-                changed |= ImGui::Combo("Stale-eye reprojection", &warp, warps, IM_ARRAYSIZE(warps));
-                bool useDibr = shift != 0;
-                if (ImGui::Checkbox("DIBR shift", &useDibr)) {
-                    shift = useDibr ? std::max(1, frameConfig.aerDibrPreference) : 0;
-                    changed = true;
-                }
-                if (useDibr && warp == static_cast<int>(AerWarpMode::Camera6DoF)) {
-                    int history = shift - 1;
-                    const char* variants[]{"Fast", "Full depth reprojection"};
-                    if (ImGui::Combo("DIBR history", &history, variants, IM_ARRAYSIZE(variants))) {
-                        shift = history + 1;
-                        changed = true;
-                    }
-                }
-                ImGui::TextDisabled("Aiming uses full stereo.");
-            }
-            if (changed) {
-                const auto warpMode = static_cast<AerWarpMode>(warp);
-                FrameMode mode = FrameMode::FullStereo;
-                if (method == 1) {
-                    mode = shift == 2 ? FrameMode::DibrForward : shift == 1 ? FrameMode::Dibr :
-                        warpMode == AerWarpMode::Camera6DoF ? FrameMode::StaleEye : FrameMode::NativeAer;
-                }
-                m_pendingFrameMode = FrameSelection{mode, warpMode};
-            }
-#ifdef ARMA_HAS_DLSS
-            if (ImGui::Checkbox("DLSS Balanced (experimental)", &frameConfig.dlssBalancedExperimental)) {
-                Log("DLSS Balanced requested=%d (menu)", frameConfig.dlssBalancedExperimental ? 1 : 0);
-            }
-#endif
+            ImGui::TextUnformatted("Full stereo");
             ImGui::Text("VR source: %u x %u", m_quadWidth, m_quadHeight);
             unsigned sceneWidth = 0, sceneHeight = 0;
             EngineStereoSceneSize(sceneWidth, sceneHeight);
@@ -448,9 +425,9 @@ void OpenXRRuntime::DrawMenuUi()
             ImGui::Text("Automatic: %u x %u. Manual: %d x %d",
                         autoWidth, autoHeight, fitW, fitH);
             if (fitW < wantW) {
-                ImGui::TextWrapped("The selected window size exceeds the desktop and has been reduced "
-                                   "so the cursor can reach the edges. Increase the desktop resolution "
-                                   "to use a larger window.");
+                ImGui::TextWrapped("The selected size exceeds the desktop, so the window was resized to fit. "
+                                   "Increase desktop resolution to use a larger window. "
+                                   "Virtual Desktop also supports a virtual monitor.");
             }
             if (ImGui::Button("Apply manual size")) {
                 MutableConfig().autoHeadsetResolution = false;
@@ -465,10 +442,10 @@ void OpenXRRuntime::DrawMenuUi()
             }
             if (applied) {
                 ImGui::TextColored(ImVec4(0.4F, 1.0F, 0.5F, 1.0F),
-                                   "Manual size will be saved when Arma exits.");
+                                   "Manual size will be saved on exit.");
             }
-            ImGui::TextWrapped("Applying a size updates Arma3.cfg after the game exits.");
-            if (ImGui::CollapsingHeader("Captures")) {
+            ImGui::TextWrapped("Manual size is written to the Arma profile after the game exits.");
+            if (ImGui::CollapsingHeader("Screenshots")) {
                 ImGui::BeginDisabled(m_worldViewState != 1 || !m_sbsInput || !m_projectionEnabled);
                 if (ImGui::Button("Stereo screenshot")) {
                     RequestStereoShots(1);

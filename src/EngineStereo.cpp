@@ -10,6 +10,7 @@
 #include "QuadMath.h"
 #include "StereoShadowShader.h"
 #include "WorldShadingRate.h"
+#include "SinglePassDepth.h"
 
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
@@ -164,6 +165,9 @@ bool g_resourcesFailed = false;
 
 // Per-frame statistics (render thread).
 std::uint32_t g_statDoubled = 0;
+std::uint32_t g_singlePassDepthDraws = 0;
+std::uint32_t g_singlePassWorldDraws = 0;
+std::uint32_t g_singlePassDepthFrames = 0;
 std::uint32_t g_statSceneDoubled = 0;
 std::uint32_t g_statUiDoubled = 0;
 std::uint64_t g_skippedDesktopHudDraws = 0;
@@ -205,6 +209,36 @@ bool UsesSceneProjection(ID3D11VertexShader* shader)
 {
     std::scoped_lock lock(g_shaderMutex);
     return g_projectedShaders.count(shader) != 0;
+}
+
+std::unordered_set<ID3D11VertexShader*> g_depthOnlyVertexShaders;
+std::unordered_set<ID3D11PixelShader*> g_emptyDepthPixelShaders;
+std::unordered_set<ID3D11VertexShader*> g_prepassVertexShaders;
+std::unordered_set<ID3D11PixelShader*> g_prepassPixelShaders;
+
+bool IsVerifiedSinglePassDraw(ID3D11DeviceContext* context, ID3D11VertexShader* vertex,
+                              ID3D11RenderTargetView* target)
+{
+    if (target) {
+        if (!GetConfig().singlePassWorldPrepass) return false;
+        D3D11_RENDER_TARGET_VIEW_DESC view{};
+        target->GetDesc(&view);
+        if (view.Format != DXGI_FORMAT_R32_FLOAT ||
+            (view.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D &&
+             view.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2DMS)) return false;
+    } else if (!GetConfig().singlePassDepth) {
+        return false;
+    }
+    {
+        std::scoped_lock lock(g_shaderMutex);
+        const auto& shaders = target ? g_prepassVertexShaders : g_depthOnlyVertexShaders;
+        if (!shaders.contains(vertex)) return false;
+    }
+    ComPtr<ID3D11PixelShader> pixel;
+    context->PSGetShader(&pixel, nullptr, nullptr);
+    std::scoped_lock lock(g_shaderMutex);
+    if (target) return pixel && g_prepassPixelShaders.contains(pixel.Get());
+    return !pixel || g_emptyDepthPixelShaders.contains(pixel.Get());
 }
 
 TargetClass Classify(ID3D11RenderTargetView* rtv, ID3D11DepthStencilView* dsv, UINT& width)
@@ -352,6 +386,14 @@ bool UploadPatch(ID3D11DeviceContext* context)
         const float half = g_halfIpd.load();
         const float measuredZoom = std::max(0.2F, g_zoom.load());
         const auto& config = GetConfig();
+        if ((config.worldYawOrbitForward != 0.0F || config.worldYawOrbitRight != 0.0F) &&
+            g_preparedWorldDepth.valid && !vehicle && measuredZoom <= 1.03F &&
+            g_renderEye.load() < 0 && !g_opticsIntent.load() &&
+            g_weaponAimingBlend.load() == 0.0F) {
+            g_preparedWorldDepth.yawOrbitCorrection = WorldYawOrbitCorrection(
+                g_preparedWorldDepth.view, g_bodyYaw.load(),
+                config.worldYawOrbitForward, config.worldYawOrbitRight);
+        }
         const float aim = std::clamp(g_weaponAimingBlend.load(), 0.0F, 1.0F);
         const bool clipOnFoot = !vehicle && measuredZoom <= 1.03F;
         g_bodyMaskPrepared = clipOnFoot && config.firstPersonHideTorso;
@@ -424,11 +466,14 @@ bool UploadPatch(ID3D11DeviceContext* context)
                 const float eyeY = physicalEyes ? shift * g_rightEyeOffset[1].load() : 0.0F;
                 const float eyeZ = physicalEyes && (layer == 1 || g_preparedWorldDepth.valid)
                     ? shift * g_rightEyeOffset[2].load() : 0.0F;
-                const float tx = (applyLean ? g_lean[0].load() : 0.0F) + g_headOffset[0].load() + eyeX;
-                const float ty = (applyLean ? g_lean[1].load() : 0.0F) + g_headOffset[1].load() + eyeY;
+                const auto& orbit = g_preparedWorldDepth.yawOrbitCorrection;
+                const float tx = (applyLean ? g_lean[0].load() : 0.0F) + g_headOffset[0].load() +
+                    eyeX + (layer == 0 ? orbit[0] : 0.0F);
+                const float ty = (applyLean ? g_lean[1].load() : 0.0F) + g_headOffset[1].load() +
+                    eyeY + (layer == 0 ? orbit[1] : 0.0F);
                 const float centerZ = layer == 0 ? -g_preparedWorldDepth.clipWOffset :
                     (applyLean ? g_lean[2].load() : 0.0F) + g_headOffset[2].load();
-                const float tz = centerZ + eyeZ;
+                const float tz = centerZ + eyeZ + (layer == 0 ? orbit[2] : 0.0F);
                 r[4] = -p00 * tx;
                 r[5] = -p11 * ty;
                 if (layer == 0) {
@@ -546,9 +591,11 @@ StereoDraw::StereoDraw(ID3D11DeviceContext* context, UINT elementCount, bool ins
         Begin(elementCount, instancedOrIndirect);
     }
     if (m_foveatedWorld) {
-        const float centers[2][2]{{g_uploaded[2], g_uploaded[3]}, {g_uploaded[10], g_uploaded[11]}};
+        const WorldShadingProjection eyes[2]{
+            {g_uploaded[0], g_uploaded[1], g_uploaded[2], g_uploaded[3]},
+            {g_uploaded[8], g_uploaded[9], g_uploaded[10], g_uploaded[11]}};
         g_worldVrsThisFrame |= SetWorldShadingRate(context, m_targetWidth,
-                                                  static_cast<UINT>(m_viewport.Height), centers);
+                                                  static_cast<UINT>(m_viewport.Height), eyes);
     } else {
         ClearWorldShadingRate(context);
     }
@@ -1100,9 +1147,12 @@ void StereoDraw::Begin(UINT elementCount, bool instanced)
                     SampleWorldDrawPose(config.detailedCapture);
                 }
             }
+            // Match the size of the last resolved independent VR scene. Half-size
+            // auxiliary passes stay at full rate and cannot churn the primary mask.
             if (rtv && !g_aerNative.load() && GetConfig().worldVrs && !g_scopeUi.load() &&
                 !g_opticsIntent.load() && g_weaponAimingBlend.load() == 0.0F &&
-                g_drawZoom.load() <= 1.03F && g_frameWorldDepth.valid) {
+                g_drawZoom.load() <= 1.03F && g_frameWorldDepth.valid && g_virtualBack.load() &&
+                width == g_virtWidth && m_viewport.Height == static_cast<float>(g_virtHeight)) {
                 D3D11_RENDER_TARGET_VIEW_DESC color{};
                 rtv->GetDesc(&color);
                 m_foveatedWorld = color.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
@@ -1153,6 +1203,31 @@ void StereoDraw::Begin(UINT elementCount, bool instanced)
     m_secondDone = renderEye >= 0;
     m_active = true;
     SetEye(renderEye < 0 ? 0 : renderEye);
+    const auto& config = GetConfig();
+    if ((config.singlePassDepth || config.singlePassWorldPrepass) && !m_secondDone && m_mainWorldDepth && m_patchable &&
+        !m_hasScissor && width == g_virtWidth && m_viewport.Height == static_cast<float>(g_virtHeight) &&
+        g_projMode.load() && g_frameWorldDepth.valid && !g_scopeUi.load() && !g_opticsIntent.load() &&
+        g_weaponAimingBlend.load() == 0.0F && g_drawZoom.load() <= 1.03F &&
+        IsVerifiedSinglePassDraw(m_context, vertexShader.Get(), rtv.Get())) {
+        const auto layout = rtv ? SinglePassLayout::WorldPrepass : SinglePassLayout::PositionOnly;
+        ID3D11Buffer* rightProjection = rtv ? PrepareEyeProjection(ProjectionVariant(1, true), true) : nullptr;
+        m_singlePassStereo = BeginSinglePassDepth(m_context, g_device.Get(), m_viewport,
+            g_uploaded, g_uploaded + kProjectionRecordFloats, m_savedDepthGeometryConstants, layout,
+            rightProjection);
+        if (m_singlePassStereo) {
+            m_secondDone = true;
+            --g_statSceneDoubled;
+            ++(rtv ? g_singlePassWorldDraws : g_singlePassDepthDraws);
+            static bool loggedDepth = false;
+            static bool loggedWorld = false;
+            bool& logged = rtv ? loggedWorld : loggedDepth;
+            if (!logged) {
+                logged = true;
+                Log("Single-pass %s active on verified draws at %ux%u",
+                    rtv ? "R32 world prepass (direct right-eye projection)" : "depth", width, g_virtHeight);
+            }
+        }
+    }
     if (!m_secondDone) {
         ++g_statDoubled;
     }
@@ -1209,6 +1284,49 @@ bool StereoDraw::BeginBodyMask(ID3D11VertexShader* shader)
     return true;
 }
 
+UINT StereoDraw::ProjectionVariant(int eye, bool projected) const
+{
+    const bool auxiliaryWorld = projected && !m_weapon && !m_mainWorldDepth;
+    const UINT layerOffset = auxiliaryWorld ? kAuxWorldOffset :
+                             m_firstPersonClip ? kClippedBodyOffset :
+                             m_weapon ? 2 * kProjectionRecordFloats : 0;
+    return layerOffset / kProjectionRecordFloats + static_cast<UINT>(eye);
+}
+
+ID3D11Buffer* StereoDraw::PrepareEyeProjection(UINT variant, bool projected)
+{
+    const UINT record = variant * kProjectionRecordFloats * sizeof(float);
+    const auto build = [&](ID3D11Buffer* target) {
+        m_context->CopyResource(target, m_originalBuffer);
+        const auto copy = [&](UINT destination, UINT source, UINT bytes) {
+            const D3D11_BOX box{record + source, 0, 0, record + source + bytes, 1, 1};
+            m_context->CopySubresourceRegion(target, 0, destination, 0, 0, g_patchBuffer.Get(), 0, &box);
+        };
+        if (projected) {
+            copy(0, 0, 4);                // P00   (cb2[0].x)
+            copy(20, 4, 4);               // P11   (cb2[1].y)
+            copy(kMatrix20Offset, 8, 8);  // M20, M21 (cb2[2].x, cb2[2].y)
+            const float clipW = g_uploaded[record / sizeof(float) + 7];
+            const bool translateDepth = m_weapon ? (m_firstPersonClip || clipW != 0.0F)
+                                                  : (m_mainWorldDepth && clipW != 0.0F);
+            // Apply the depth translation to clip.z and clip.w together.
+            copy(kMatrix30Offset, 16, translateDepth ? 16U : 8U);
+        } else {
+            copy(kMatrix20Offset, 8, 4);
+            copy(kMatrix30Offset, 16, 4);
+        }
+    };
+    if (GetConfig().cacheStereoProjection) {
+        if (auto* cached = EngineProjectionCache().GetOrBuild(m_context, g_device.Get(),
+                                                            m_originalBuffer, variant, build)) {
+            return cached;
+        }
+    }
+    ID3D11Buffer* target = g_eyeBuffer[variant % 2].Get();
+    build(target);
+    return target;
+}
+
 void StereoDraw::SetEye(int eye)
 {
     // x' = ax*x + bx, y' = ay*y + by maps a back buffer pixel to this eye's half.
@@ -1254,7 +1372,8 @@ void StereoDraw::SetEye(int eye)
             if (!lens && GetConfig().hudBodyLock && g_hudLock.load()) {
                 // The HUD stays where the body aims (like the weapon) while the head looks
                 // around: put its centre where the aim direction lies in this eye image.
-                // The panel is anchored in front of the recenter direction.
+                // As in the Tarkov mod (HudLayer): a panel fixed in the room in front of the
+                // recentre direction (it follows the weapon pitch, the mouse does not turn it).
                 // Head movement gives parallax: the centre of the panel in camera space is
                 // distance * aim direction - head offset, and the panel grows when the head
                 // comes closer.
@@ -1299,44 +1418,15 @@ void StereoDraw::SetEye(int eye)
     }
     if (m_patchable) {
         const bool projected = g_projMode.load();
-        const bool auxiliaryWorld = projected && !m_weapon && !m_mainWorldDepth;
-        const UINT layerOffset = auxiliaryWorld ? kAuxWorldOffset :
-                                 m_firstPersonClip ? kClippedBodyOffset :
-                                 m_weapon ? 2 * kProjectionRecordFloats : 0;
-        const UINT variant = layerOffset / kProjectionRecordFloats + static_cast<UINT>(eye);
-        const UINT record = variant * kProjectionRecordFloats * sizeof(float);
-        const auto build = [&](ID3D11Buffer* target) {
-            m_context->CopyResource(target, m_originalBuffer);
-            const auto copy = [&](UINT destination, UINT source, UINT bytes) {
-                const D3D11_BOX box{record + source, 0, 0, record + source + bytes, 1, 1};
-                m_context->CopySubresourceRegion(target, 0, destination, 0, 0, g_patchBuffer.Get(), 0, &box);
-            };
-            if (projected) {
-                copy(0, 0, 4);                // P00   (cb2[0].x)
-                copy(20, 4, 4);               // P11   (cb2[1].y)
-                copy(kMatrix20Offset, 8, 8);  // M20, M21 (cb2[2].x, cb2[2].y)
-                const float clipW = g_uploaded[record / sizeof(float) + 7];
-                const bool translateDepth = m_weapon ? (m_firstPersonClip || clipW != 0.0F)
-                                                      : (m_mainWorldDepth && clipW != 0.0F);
-                // Apply the depth translation to clip.z and clip.w together.
-                copy(kMatrix30Offset, 16, translateDepth ? 16U : 8U);
-            } else {
-                copy(kMatrix20Offset, 8, 4);
-                copy(kMatrix30Offset, 16, 4);
-            }
-        };
-        if (!GetConfig().cacheStereoProjection ||
-            !EngineProjectionCache().Bind(m_context, g_device.Get(), m_originalBuffer, kProjectionSlot, variant, build)) {
-            ID3D11Buffer* target = g_eyeBuffer[eye].Get();
-            build(target);
-            m_context->VSSetConstantBuffers(kProjectionSlot, 1, &target);
-        }
+        const UINT variant = ProjectionVariant(eye, projected);
+        ID3D11Buffer* target = PrepareEyeProjection(variant, projected);
+        m_context->VSSetConstantBuffers(kProjectionSlot, 1, &target);
 
         if (m_bodyMask) {
             ID3D11Buffer* constants = g_bodyMaskConstants[eye].Get();
             const std::uint64_t frame = g_frame.load(std::memory_order_relaxed);
             if (g_bodyMaskFrame[eye] != frame) {
-                const float* r = g_uploaded + record / sizeof(float);
+                const float* r = g_uploaded + variant * kProjectionRecordFloats;
                 const float yaw = g_bodyYaw.load(), pitch = g_bodyPitch.load();
                 const float sy = std::sin(yaw), cy = std::cos(yaw);
                 const float sp = std::sin(pitch), cp = std::cos(pitch);
@@ -1425,6 +1515,9 @@ StereoDraw::~StereoDraw()
         RestoreRedirectedDraw();
         return;
     }
+    if (m_singlePassStereo) {
+        EndSinglePassDepth(m_context, m_savedDepthGeometryConstants.Get());
+    }
     m_context->RSSetViewports(1, &m_viewport);
     if (m_hasScissor) {
         m_context->RSSetScissorRects(1, &m_scissor);
@@ -1467,7 +1560,13 @@ void EngineStereoNoteVertexShader(ID3D11VertexShader* shader, const void* code, 
         g_projectedShaders.erase(shader);
         g_skinnedShaders.erase(shader);
         g_hudMarkerVertexShaders.erase(shader);
-        if (length == 604) {
+        g_depthOnlyVertexShaders.erase(shader);
+        g_prepassVertexShaders.erase(shader);
+        const bool depthCandidate = GetConfig().singlePassDepth &&
+            (length == 8956 || length == 1148 || length == 10784 || length == 796);
+        const bool prepassCandidate = GetConfig().singlePassWorldPrepass &&
+            (length == 1880 || length == 1700 || length == 2608 || length == 5440 || length == 4812);
+        if (length == 604 || depthCandidate || prepassCandidate) {
             std::uint64_t hash = 1469598103934665603ULL;
             const auto* bytes = static_cast<const unsigned char*>(code);
             for (SIZE_T i = 0; i < length; ++i) {
@@ -1475,6 +1574,18 @@ void EngineStereoNoteVertexShader(ID3D11VertexShader* shader, const void* code, 
             }
             if (hash == 0x678df5acc771c4b2ULL) {
                 g_hudMarkerVertexShaders.insert(shader);
+            }
+            // Captured world prepass shaders write only SV_Position with the cb2 projection.
+            if (depthCandidate && (hash == 0x98d2b153d475c67fULL || hash == 0xbe9e995a4df8aeb9ULL ||
+                hash == 0xb0ad7d667687a1f1ULL || hash == 0xf6133f99a5727677ULL)) {
+                g_depthOnlyVertexShaders.insert(shader);
+            }
+            // In these shaders the patched cb2 projection rows feed SV_Position alone.
+            // Their TEXCOORD outputs can be forwarded to both viewports unchanged.
+            if (prepassCandidate && (hash == 0xd8c45c8412ed8119ULL || hash == 0x7a034df3ab737852ULL ||
+                hash == 0x2c42c71658fd3092ULL || hash == 0xe5be18a571962f9cULL ||
+                hash == 0x13070def8bbd1e95ULL || hash == 0xb8ebeb58ba2ba726ULL)) {
+                g_prepassVertexShaders.insert(shader);
             }
         }
         if (text.find("dcl_output_siv o0.xyzw, position") != std::string_view::npos &&
@@ -1525,6 +1636,19 @@ void EngineStereoNoteVertexShader(ID3D11VertexShader* shader, const void* code, 
 void EngineStereoNotePixelShader(ID3D11PixelShader* shader, std::uint64_t bytecodeHash)
 {
     std::scoped_lock lock(g_shaderMutex);
+    // These shaders consume the verified interpolants and only write SV_Target0.
+    if (GetConfig().singlePassWorldPrepass && (bytecodeHash == 0x70d42f7413931f06ULL ||
+        bytecodeHash == 0x9415ff056842a49bULL || bytecodeHash == 0x93b19fefd1f317c0ULL ||
+        bytecodeHash == 0x8a76294ec7603869ULL)) {
+        g_prepassPixelShaders.insert(shader);
+    } else {
+        g_prepassPixelShaders.erase(shader);
+    }
+    if (GetConfig().singlePassDepth && bytecodeHash == 0xb403f48cb35d9739ULL) {
+        g_emptyDepthPixelShaders.insert(shader);
+    } else {
+        g_emptyDepthPixelShaders.erase(shader);
+    }
     if (bytecodeHash == 0x48c433fb9f5427e7ULL) {
         g_shadowResolveShaders.insert(shader);
     } else {
@@ -1697,8 +1821,9 @@ float EngineStereoZoom()
 
 void EngineStereoResetZoomReference()
 {
-    // Keep the widest field of view. Recentring while scoped would otherwise replace
-    // the unzoomed reference with the scope's narrower projection.
+    // Kept on purpose: the reference is the widest game field of view ever seen. Resetting it on
+    // recentre took a zoomed value as "not zoomed" (log 2026-11-17 20:12: false zoom 1.32, a
+    // false aiming lock and a jumping picture).
 }
 
 void EngineStereoSetWeapon(float separationScale, float convergenceMeters, float sizeScale)
@@ -1797,6 +1922,11 @@ void EngineStereoOnPresent(IDXGISwapChain* swapChain)
     }
     foreignPresents = 0;
     ++g_presents;
+    if ((GetConfig().singlePassDepth || GetConfig().singlePassWorldPrepass) && ++g_singlePassDepthFrames == 240) {
+        Log("Single-pass depth issued %u draws in the last 240 presents", g_singlePassDepthDraws);
+        Log("Single-pass R32 world prepass issued %u draws in the last 240 presents", g_singlePassWorldDraws);
+        g_singlePassDepthFrames = g_singlePassDepthDraws = g_singlePassWorldDraws = 0;
+    }
     g_frame.fetch_add(1);
     if (GetConfig().cacheStereoProjection) {
         EngineProjectionCache().Invalidate();
@@ -1963,7 +2093,7 @@ void EngineStereoOnPresent(IDXGISwapChain* swapChain)
             const bool ok = DumpBackBufferJpeg(swapChain, path.c_str());
             Log("STEREO back buffer dump %d %s (%ls); head look yaw=%.1f pitch=%.1f deg (positive "
                 "left/up), lean right/up/forward = %.3f %.3f %.3f m",
-                g_dumps, ok ? "written" : "FAILED", path.filename().c_str(),
+                g_dumps, ok ? "written" : "FAILED", path.c_str(),
                 std::asin(std::clamp(g_weaponForward[0].load(), -1.0F, 1.0F)) * 57.29578F,
                 std::asin(std::clamp(-g_weaponForward[1].load(), -1.0F, 1.0F)) * 57.29578F,
                 g_lean[0].load(), g_lean[1].load(), g_lean[2].load());

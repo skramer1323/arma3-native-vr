@@ -22,11 +22,11 @@ public:
     Stats TakeStats();
 
     template <typename Build>
-    bool Bind(ID3D11DeviceContext* context, ID3D11Device* device, ID3D11Buffer* source,
-              UINT slot, UINT variant, Build build)
+    ID3D11Buffer* GetOrBuild(ID3D11DeviceContext* context, ID3D11Device* device,
+                             ID3D11Buffer* source, UINT variant, Build build)
     {
         if (!m_enabled.load(std::memory_order_relaxed) || context != m_context.load(std::memory_order_relaxed)) {
-            return false;
+            return nullptr;
         }
         std::scoped_lock lock(m_mutex);
         if (source != m_source.Get()) {
@@ -34,7 +34,7 @@ public:
             source->GetDesc(&desc);
             // Shared resources can be modified outside our immediate context.
             if (desc.MiscFlags != 0 || desc.BindFlags != D3D11_BIND_CONSTANT_BUFFER) {
-                return false;
+                return nullptr;
             }
             m_source = source;
             m_watched.store(source);
@@ -48,7 +48,7 @@ public:
             desc.Usage = D3D11_USAGE_DEFAULT;
             desc.CPUAccessFlags = 0;
             if (FAILED(device->CreateBuffer(&desc, nullptr, entry.buffer.GetAddressOf()))) {
-                return false;
+                return nullptr;
             }
         }
         const auto revision = m_revision.load(std::memory_order_relaxed);
@@ -59,9 +59,7 @@ public:
         } else {
             ++m_reused;
         }
-        ID3D11Buffer* target = entry.buffer.Get();
-        context->VSSetConstantBuffers(slot, 1, &target);
-        return true;
+        return entry.buffer.Get();
     }
 
 private:

@@ -104,7 +104,8 @@ std::atomic<bool> g_capturing = false;
 std::mutex g_cullMutex;
 std::unordered_map<void*, std::uint64_t> g_pixelShaderHash;  // pixel shader -> FNV hash of bytecode
 std::atomic<std::uint32_t> g_culledDraws{0};
-// Pixel shaders using PSC_GodRayPars for sun glow in game build 2.22.0.154089.
+// Pixel shaders of the god-ray / sun glow post effect (they use PSC_GodRayPars): frame probe
+// 2026-11-19, game build 2.22.0.154089, hashes as in arma3_vr_shaders\ps_<hash>.dxbc.
 constexpr std::uint64_t kGodRayShaders[] = {0x084b7cb9e89f267dULL, 0xa020fbf71e249da7ULL,
                                             0xaf824b34826d4e08ULL, 0xcedf2729f49513acULL,
                                             0xe2ac5c5ff69e0e8bULL};
@@ -888,8 +889,7 @@ void WriteStack(FILE* file, const char* label, const CaptureStack& stack)
         }
         const auto delta = reinterpret_cast<std::uintptr_t>(address) -
                            reinterpret_cast<std::uintptr_t>(module);
-        const auto moduleName = std::filesystem::path(path).filename();
-        std::fprintf(file, "  %ls + 0x%llx (%p)\n", moduleName.c_str(),
+        std::fprintf(file, "  %ls + 0x%llx (%p)\n", path,
                      static_cast<unsigned long long>(delta), address);
     }
 }
@@ -931,7 +931,7 @@ void WriteCapture(IDXGISwapChain* swapChain)
         ModuleDirectory() / (L"arma3_native_vr.frame" + std::to_wstring(g_captures));
     FILE* file = nullptr;
     if (_wfopen_s(&file, (base.wstring() + L".txt").c_str(), L"w") != 0 || !file) {
-        Log("PROBE could not write %ls.txt", base.filename().c_str());
+        Log("PROBE could not write %ls.txt", base.c_str());
         return;
     }
 
@@ -1114,7 +1114,7 @@ void WriteCapture(IDXGISwapChain* swapChain)
                          textureId(record.depth.texture), record.depthRange[0], record.depthRange[1]);
         }
         if (!DumpBackBufferJpeg(swapChain, (base.wstring() + L".jpg").c_str())) {
-            Log("PROBE frame image failed: %ls.jpg", base.filename().c_str());
+            Log("PROBE frame image failed: %ls.jpg", base.c_str());
         }
     }
 

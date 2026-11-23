@@ -6,6 +6,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -16,7 +17,6 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 // NVIDIA NVAPI D3D11 ABI (nvapi.h and nvapi_interface.h).
-constexpr UINT kTile = 16;
 enum class PixelRate : UINT { PerPixel = 5, TwoByOne = 6, OneByTwo = 7, TwoByTwo = 8 };
 struct ViewportRate {
     bool enabled;
@@ -48,6 +48,7 @@ struct State {
     ComPtr<ID3D11View> view;
     UINT width = 0;
     UINT height = 0;
+    WorldShadingProjection eyes[2]{};
     bool active = false;
     bool unavailable = false;
 };
@@ -68,23 +69,19 @@ bool LoadNvapi()
 }
 
 bool BuildRateView(ID3D11DeviceContext* context, UINT width, UINT height,
-                   const float (&eyeCenters)[2][2])
+                   const WorldShadingProjection (&eyes)[2])
 {
     ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
-    const UINT columns = (width + kTile - 1) / kTile;
-    const UINT rows = (height + kTile - 1) / kTile;
-    const float halfWidth = width * 0.5F;
+    const UINT columns = (width + kWorldShadingTile - 1) / kWorldShadingTile;
+    const UINT rows = (height + kWorldShadingTile - 1) / kWorldShadingTile;
     std::vector<std::uint8_t> rates(static_cast<std::size_t>(columns) * rows);
+    std::array<unsigned, 4> counts{};
     for (UINT y = 0; y < rows; ++y) {
         for (UINT x = 0; x < columns; ++x) {
-            const float px = (x + 0.5F) * kTile;
-            const unsigned eye = px >= halfWidth ? 1U : 0U;
-            const float offsetX = 2.0F * (px / halfWidth - eye) - 1.0F - eyeCenters[eye][0];
-            const float offsetY = 1.0F - 2.0F * (y + 0.5F) * kTile / height - eyeCenters[eye][1];
-            const float radius2 = offsetX * offsetX + offsetY * offsetY;
-            rates[static_cast<std::size_t>(y) * columns + x] = radius2 <= 0.70F * 0.70F ? 0 :
-                radius2 > 1.10F * 1.10F ? 3 : std::fabs(offsetX) > std::fabs(offsetY) ? 1 : 2;
+            const auto rate = static_cast<std::uint8_t>(WorldShadingTileRate(x, y, width, height, eyes));
+            rates[static_cast<std::size_t>(y) * columns + x] = rate;
+            ++counts[rate];
         }
     }
     D3D11_TEXTURE2D_DESC desc{};
@@ -106,20 +103,45 @@ bool BuildRateView(ID3D11DeviceContext* context, UINT width, UINT height,
     g_vrs.context = context;
     g_vrs.width = width;
     g_vrs.height = height;
-    Log("World VRS mask prepared for two eyes at %ux%u", width, height);
+    std::copy_n(eyes, 2, g_vrs.eyes);
+    Log("World VRS angular mask %ux%u: %u full-rate, %u half-rate, %u quarter-rate tiles",
+        width, height, counts[0], counts[1] + counts[2], counts[3]);
     return true;
+}
+
+bool ProjectionMoved(const WorldShadingProjection (&eyes)[2], UINT width, UINT height)
+{
+    // Rebuild after about half a tile of NDC drift at the center or edge.
+    const float toleranceX = 2.0F * kWorldShadingTile / width;
+    const float toleranceY = static_cast<float>(kWorldShadingTile) / height;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        const auto& previous = g_vrs.eyes[eye];
+        if (std::fabs(eyes[eye].offsetX - previous.offsetX) + std::fabs(eyes[eye].scaleX - previous.scaleX) >
+                toleranceX ||
+            std::fabs(eyes[eye].offsetY - previous.offsetY) + std::fabs(eyes[eye].scaleY - previous.scaleY) >
+                toleranceY) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace
 
 bool SetWorldShadingRate(ID3D11DeviceContext* context, UINT width, UINT height,
-                         const float (&eyeCenters)[2][2])
+                         const WorldShadingProjection (&eyes)[2])
 {
     if (g_vrs.unavailable) return false;
-    if (g_vrs.context.Get() != context || g_vrs.width != width || g_vrs.height != height || !g_vrs.view) {
+    if (!width || !height || !ValidWorldShadingProjection(eyes[0]) ||
+        !ValidWorldShadingProjection(eyes[1])) {
+        ClearWorldShadingRate(context);
+        return false;
+    }
+    if (g_vrs.context.Get() != context || g_vrs.width != width || g_vrs.height != height ||
+        !g_vrs.view || ProjectionMoved(eyes, width, height)) {
         ClearWorldShadingRate();
         g_vrs.view.Reset();
-        if (!LoadNvapi() || !BuildRateView(context, width, height, eyeCenters)) {
+        if (!LoadNvapi() || !BuildRateView(context, width, height, eyes)) {
             g_vrs.unavailable = true;
             Log("World VRS unavailable; rendering at full shading rate");
             return false;

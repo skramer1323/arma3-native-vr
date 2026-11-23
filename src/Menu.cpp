@@ -51,9 +51,11 @@ bool Menu::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
     io.LogFilename = nullptr;
     io.MouseDrawCursor = true;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-    ImFontConfig fontConfig;
-    fontConfig.SizePixels = 26.0F;
-    io.Fonts->AddFontDefaultVector(&fontConfig);
+    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 26.0F, nullptr,
+                                                io.Fonts->GetGlyphRangesCyrillic());
+    if (!font) {
+        Log("MENU Segoe UI not found, default font (Cyrillic letters will be missing)");
+    }
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 10.0F;

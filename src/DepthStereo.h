@@ -13,6 +13,7 @@ namespace a3vr {
 // One finished game frame + the game's scene depth buffer -> a left and a right
 // image: every pixel is moved sideways by a parallax that depends on its
 // distance. No engine camera is touched, both eyes come from the same frame.
+// Method and shader come from the lab's goh-vr-cinema mod.
 //
 // The scene depth buffer is found generically: ClearDepthStencilView calls on
 // the game's device context are observed, the largest depth texture with the

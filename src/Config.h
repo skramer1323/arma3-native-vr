@@ -34,7 +34,8 @@ struct Config {
     float weaponSize = 0.6F;  // projection layer: size of the weapon layer on the picture
     // Show the frame with the head pose the engine actually received (matched by dataId).
     bool poseBySequence = true;
-    // Submit the stereo world to OpenXR with the headset's per-eye frusta.
+    // World view with engine stereo: draw each eye with the headset's own frustum and submit a
+    // projection layer (like Tarkov KBM VR) instead of a window (quad) showing the game picture.
     bool projectionLayer = true;
     bool steamVrWorldQuad = true;
     bool steamVrMirrorHud = false;
@@ -43,7 +44,11 @@ struct Config {
     bool dibrForwardHistory = false;
     AerWarpMode aerWarpMode = AerWarpMode::Camera6DoF;
     int aerDibrPreference = 0;  // 0 off, 1 DIBR, 2 DIBR with forward history
-    // Automatic sizing uses the runtime's recommended eye extent.
+    // AER with the engine's own projection and the whole target per eye (SnowRunner-style): every
+    // screen-space effect (shadows, AO, glow) is computed for one normal camera. Needs AER on.
+    // Port of the SnowRunner VR mod: the game window is made exactly this client size (the headset's
+    // per-eye resolution) so the game renders one eye per frame at 1:1 pixels. 0 = off. Windowed
+    // mode needed. Automatic sizing uses the runtime's recommended eye extent.
     bool autoHeadsetResolution = true;
     int forceGameWidth = 0;
     int forceGameHeight = 0;
@@ -59,8 +64,8 @@ struct Config {
     // Use the engine's full 3D scene as the OpenXR source and keep the game window independent.
     bool virtualBackBuffer = false;
     int dibrFillMode = 1;  // DIBR holes: 0 magenta, 1 stale eye then background, 2 background only
-    // While aiming, the view follows the sight line. Head motion is relative to the start
-    // of aiming. AimEye selects the eye
+    // Aiming (as in the Tarkov KBM VR mod): while aiming the view follows the game camera (the
+    // sight line); only the head motion since aiming started turns it further. AimEye: the eye
     // that is put on the sight line (1 right, -1 left, 0 between the eyes).
     bool adsLockView = true;
     bool adsRightMouseToggle = false;
@@ -73,7 +78,7 @@ struct Config {
     // calibration of this session. Frame: 0 = body (recentre direction), 1 = looking direction.
     // Anchor the extra weapon distance to the body's aim direction. Arma supplies the pose.
     // M22/M32: depth constants of the weapon layer's projection
-    // measured in the weapon pass (1.00002 / -0.01).
+    // (frame probe 2026-11-17: 1.00002 / -0.01).
     bool weaponBodyLock = true;
     float headOffset[3]{0.0F, 0.0F, 0.0F};  // saved head placement (Ctrl+arrows, Ctrl+Delete)
     // Head placement inside a vehicle (the roof is lower): same keys, saved with Ctrl+Delete.
@@ -83,10 +88,10 @@ struct Config {
     int headPlacementMode = 0;  // 0 configured default, 1 on foot, 2 vehicle
     bool weaponHeadPosition = false;  // Same-frame stereo head lean for inspecting on foot.
     // The 2D HUD is drawn once into its own texture and shown as an OpenXR quad fixed in the room
-    // in front of the recenter direction.
+    // in front of the recentre direction (Tarkov KBM VR HudLayer): no doubling, no bending.
     // The sun/god-ray post effect is computed once over the whole side-by-side picture, so its glow
     // sits on the seam (left eye sees it on the right, right eye on the left). Its draws into the
-    // scene colour target are skipped.
+    // scene colour target are skipped (frame probe 2026-11-19).
     bool cullGodRays = true;
     // Diagnostic: pixel-shader hashes (hex, comma separated, "CullHashes=") whose small screen-space
     // draws are skipped, to find which post effect breaks the side-by-side picture.
@@ -112,6 +117,8 @@ struct Config {
     bool staleEyeWarp = false;
     bool stereoShadows = true;
     bool worldVrs = false;
+    bool singlePassDepth = false;
+    bool singlePassWorldPrepass = false;
     float weaponProjM22 = 1.00002F;
     float weaponProjM32 = -0.01F;
     float firstPersonClipCm = 0.0F;
@@ -121,6 +128,8 @@ struct Config {
     int headPositionFrame = 0;
     float headPositionScale = 1.0F;
     float headPositionLimitMeters = 0.25F;
+    float worldYawOrbitForward = 0.0F;
+    float worldYawOrbitRight = 0.0F;
     // Use the measured yaw/pitch response of the calibration (off: the plain gain is used).
     bool calibratedRotation = false;
     bool useSrgbSwapchain = true;

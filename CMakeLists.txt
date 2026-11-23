@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(Arma3NativeVR VERSION 0.1.0 LANGUAGES C CXX)
+project(Arma3NativeVR VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -77,6 +77,7 @@ add_library(Arma3NativeVR SHARED
     src/BodyMask.cpp
     src/EngineStereo.cpp
     src/WorldShadingRate.cpp
+    src/SinglePassDepth.cpp
     src/EngineStereo.h
     src/FrameProbe.cpp
     src/Perf.cpp
@@ -148,6 +149,7 @@ set_target_properties(Arma3NativeVRFreeTrack PROPERTIES
 # Unit tests for the pure helpers (no game, no OpenXR runtime).
 add_executable(Arma3NativeVRTests tests/QuadMathTests.cpp)
 target_include_directories(Arma3NativeVRTests PRIVATE src)
+target_link_libraries(Arma3NativeVRTests PRIVATE OpenXR::headers)
 if(MSVC)
     target_compile_options(Arma3NativeVRTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
 endif()
@@ -155,4 +157,4 @@ set_target_properties(Arma3NativeVRTests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
 )
 enable_testing()
-add_test(NAME QuadMath COMMAND Arma3NativeVRTests)
+add_test(NAME VRMathInvariants COMMAND Arma3NativeVRTests)

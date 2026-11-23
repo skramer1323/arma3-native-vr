@@ -97,13 +97,14 @@ void LoadConfig()
         std::clamp(ReadFloat(L"WeaponConvergenceMeters", 0.7F), 0.2F, 5.0F);
     g_config.weaponSize = std::clamp(ReadFloat(L"WeaponSizeScale", 0.6F), 0.2F, 1.5F);
     g_config.poseBySequence = ReadInt(L"PoseBySequence", 1) != 0;
-    g_config.projectionLayer = ReadInt(L"ProjectionLayer", 1) != 0;
+    // This build always renders both eyes from the same game frame.
+    g_config.projectionLayer = true;
     g_config.steamVrWorldQuad = ReadInt(L"SteamVRWorldQuad", 1) != 0;
     g_config.steamVrMirrorHud = ReadInt(L"SteamVRMirrorHud", 0) != 0;
-    g_config.alternateEyeProjection = ReadInt(L"AlternateEyeProjection", 0) != 0;
-    g_config.dibrShift = ReadInt(L"DibrShift", 0) != 0;
-    g_config.dibrForwardHistory = ReadInt(L"DibrForwardHistory", 0) != 0;
-    g_config.aerNative = ReadInt(L"AerNative", 0) != 0;
+    g_config.alternateEyeProjection = false;
+    g_config.dibrShift = false;
+    g_config.dibrForwardHistory = false;
+    g_config.aerNative = false;
     g_config.forceGameWidth = std::clamp(ReadInt(L"ForceGameWidth", 0), 0, 8192);
     g_config.forceGameHeight = std::clamp(ReadInt(L"ForceGameHeight", 0), 0, 8192);
     const bool hasManualResolution = g_config.forceGameWidth > 0 && g_config.forceGameHeight > 0;
@@ -128,17 +129,15 @@ void LoadConfig()
     g_config.hideGameplayHud = ReadInt(L"HideGameplayHud", 0) != 0;
     g_config.hudBodyLock = ReadInt(L"HudBodyLock", 1) != 0;
     g_config.stabilizeHudMarker = ReadInt(L"StabilizeHudMarker", 0) != 0;
-    g_config.dlssBalancedExperimental = ReadInt(L"DlssBalancedExperimental", 0) != 0;
+    g_config.dlssBalancedExperimental = false;
     g_config.cacheStereoProjection = ReadInt(L"CacheStereoProjection", 0) != 0;
-    g_config.staleEyeWarp = ReadInt(L"StaleEyeWarp", 0) != 0;
-    const int defaultWarp = g_config.alternateEyeProjection && !g_config.dibrShift &&
-        !g_config.staleEyeWarp ? static_cast<int>(AerWarpMode::CameraRotation)
-                               : static_cast<int>(AerWarpMode::Camera6DoF);
-    g_config.aerWarpMode = static_cast<AerWarpMode>(std::clamp(ReadInt(L"AerWarpMode", defaultWarp), 0, 3));
-    g_config.aerDibrPreference = std::clamp(ReadInt(L"AerDibrPreference",
-        g_config.dibrShift ? (g_config.dibrForwardHistory ? 2 : 1) : 0), 0, 2);
+    g_config.staleEyeWarp = false;
+    g_config.aerWarpMode = AerWarpMode::Off;
+    g_config.aerDibrPreference = 0;
     g_config.stereoShadows = ReadInt(L"StereoShadows", 1) != 0;
     g_config.worldVrs = ReadInt(L"WorldVrs", 0) != 0;
+    g_config.singlePassDepth = ReadInt(L"SinglePassDepth", 0) != 0;
+    g_config.singlePassWorldPrepass = ReadInt(L"SinglePassWorldPrepass", 0) != 0;
     g_config.weaponBodyLock = ReadInt(L"WeaponBodyLock", 1) != 0;
     g_config.headOffset[0] = std::clamp(ReadFloat(L"HeadOffsetX", 0.0F), -0.6F, 0.6F);
     g_config.headOffset[1] = std::clamp(ReadFloat(L"HeadOffsetY", 0.0F), -0.6F, 0.6F);
@@ -162,12 +161,16 @@ void LoadConfig()
     g_config.headPositionScale = std::clamp(ReadFloat(L"HeadPositionScale", 1.0F), 0.0F, 3.0F);
     g_config.headPositionLimitMeters =
         std::clamp(ReadFloat(L"HeadPositionLimitMeters", 0.25F), 0.0F, 0.3F);
+    g_config.worldYawOrbitForward =
+        std::clamp(ReadFloat(L"WorldYawOrbitForward", 0.0F), -0.2F, 0.2F);
+    g_config.worldYawOrbitRight =
+        std::clamp(ReadFloat(L"WorldYawOrbitRight", 0.0F), -0.2F, 0.2F);
     g_config.calibratedRotation = ReadInt(L"CalibratedRotation", 0) != 0;
     g_config.zoomMagnification = std::clamp(ReadFloat(L"ZoomMagnification", 1.0F), 0.0F, 1.0F);
     g_config.quadHeightOffsetMeters =
         std::clamp(ReadFloat(L"QuadHeightOffsetMeters", 0.0F), -1.5F, 1.5F);
     g_config.useSrgbSwapchain = ReadInt(L"UseSrgbSwapchain", 1) != 0;
-    g_config.tuningHotkeys = ReadInt(L"TuningHotkeys", 1) != 0;
+    g_config.tuningHotkeys = false;
     g_config.statsEveryPresents = std::max(0, ReadInt(L"StatsEveryPresents", 600));
     g_config.perfLog = ReadInt(L"PerfLog", 0) != 0;
     g_config.drawCursor = ReadInt(L"DrawCursor", 1) != 0;
@@ -179,31 +182,29 @@ void LoadConfig()
     g_config.headYawSign = ReadInt(L"HeadYawSign", 1) < 0 ? -1 : 1;
     g_config.headPitchSign = ReadInt(L"HeadPitchSign", 1) < 0 ? -1 : 1;
     g_config.poseLagFrames = std::clamp(ReadInt(L"PoseLagFrames", 1), 1, 4);
-    g_config.stabilizeArmaRoll = ReadInt(L"StabilizeArmaRoll", 0) != 0;
+    g_config.stabilizeArmaRoll = ReadInt(L"StabilizeArmaRoll", 1) != 0;
     g_config.worldQuadDistanceMeters =
         std::clamp(ReadFloat(L"WorldQuadDistanceMeters", 5.0F), 0.5F, 50.0F);
     g_config.worldFovTanVertical = std::clamp(ReadFloat(L"WorldFovTanVertical", 0.75F), 0.05F, 5.0F);
-    g_config.stereoMode = std::clamp(ReadInt(L"StereoMode", 0), 0, 1);
+    g_config.stereoMode = 0;
     g_config.stereoShiftMillimeters =
         std::clamp(ReadFloat(L"StereoShiftMillimeters", 30.0F), 0.0F, 2000.0F);
     g_config.stereoSwapEyes = ReadInt(L"StereoSwapEyes", 0) != 0;
     g_config.headsetIpdMeters = std::clamp(ReadFloat(L"HeadsetIpdMeters", 0.064F), 0.04F, 0.08F);
     g_config.stereoScale = std::clamp(ReadFloat(L"StereoScale", 1.0F), 0.0F, 3.0F);
     g_config.autoCalibrate = ReadInt(L"AutoCalibrate", 0) != 0;
-    g_config.depthStereo = ReadInt(L"DepthStereo", 1) != 0;
+    g_config.depthStereo = false;
     g_config.convergenceMeters = std::clamp(ReadFloat(L"ConvergenceMeters", 1.0F), 0.05F, 200.0F);
     g_config.depthReversed = std::clamp(ReadInt(L"DepthReversed", -1), -1, 1);
-    g_config.sbsInput = ReadInt(L"SbsInput", 0) != 0;
+    g_config.sbsInput = true;
     g_config.frameProbe = ReadInt(L"FrameProbe", 0) != 0;
-    g_config.engineStereo = ReadInt(L"EngineStereo", 0) != 0;
+    g_config.engineStereo = true;
     g_config.engineStereoSeparationMeters =
         std::clamp(ReadFloat(L"EngineStereoSeparationMeters", 0.064F), 0.0F, 0.5F);
     g_config.engineStereoConvergenceMeters =
         std::clamp(ReadFloat(L"EngineStereoConvergenceMeters", 5.0F), 0.2F, 200.0F);
     g_config.frameDumpSeconds = std::clamp(ReadInt(L"FrameDumpSeconds", 0), 0, 3600);
     g_config.detailedCapture = ReadInt(L"DetailedCapture", 0) != 0;
-    // The engine now produces side-by-side halves: the headset side must split them.
-    g_config.sbsInput = g_config.sbsInput || g_config.engineStereo;
     g_config.frameProbeAutoSeconds = std::clamp(ReadInt(L"FrameProbeAutoSeconds", 0), 0, 3600);
     Log("SbsInput=%d FrameProbe=%d FrameProbeAutoSeconds=%d EngineStereo=%d separation=%.3f "
         "convergence=%.2f FrameDumpSeconds=%d",

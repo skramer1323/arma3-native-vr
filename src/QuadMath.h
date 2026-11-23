@@ -5,12 +5,36 @@
 #include <dxgiformat.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <utility>
 #include <vector>
 
 namespace a3vr {
+
+// Arma rotates the infantry camera around an offset anchor when FreeTrack
+// turns the view. Return the correction in camera right/up/forward axes.
+inline std::array<float, 3> WorldYawOrbitCorrection(
+    const std::array<float, 16>& view, float headYaw, float forward, float right)
+{
+    const float horizontal = std::hypot(view[2], view[10]);
+    if (!std::isfinite(horizontal) || horizontal < 0.05F) {
+        return {};
+    }
+    const float viewX = view[2] / horizontal;
+    const float viewZ = view[10] / horizontal;
+    const float cosine = std::cos(headYaw);
+    const float sine = std::sin(headYaw);
+    // The renderer uses +Z forward and the headset's positive yaw turns left.
+    const float forwardDeltaX = viewX * (cosine - 1.0F) + viewZ * sine;
+    const float forwardDeltaZ = viewZ * (cosine - 1.0F) - viewX * sine;
+    const float weight = std::clamp((horizontal - 0.05F) / 0.10F, 0.0F, 1.0F);
+    const float x = weight * (forward * forwardDeltaX + right * forwardDeltaZ);
+    const float z = weight * (forward * forwardDeltaZ - right * forwardDeltaX);
+    return {x * view[0] + z * view[8], x * view[1] + z * view[9],
+            x * view[2] + z * view[10]};
+}
 
 inline float ClampQuadWidth(float meters)
 {
@@ -64,6 +88,13 @@ inline float CameraRollFromView(float rightY, float upY)
     }
     const float t = std::clamp((horizontal - 0.04F) / 0.16F, 0.0F, 1.0F);
     return std::atan2(rightY, upY) * t * t * (3.0F - 2.0F * t);
+}
+
+inline float OnFootCameraRollFromView(float rightY, float upY)
+{
+    // Arma can pitch the on-foot camera past vertical. At that point projected
+    // world up points down even without any camera bank.
+    return CameraRollFromView(rightY, std::fabs(upY));
 }
 
 // Choose a 16:9 game frame with room for two full eye images at the requested density.
@@ -134,7 +165,7 @@ inline DXGI_FORMAT SrgbVariant(DXGI_FORMAT format)
 
 // The swapchain must be in the back buffer's typeless group, because the
 // back buffer is copied with CopySubresourceRegion (no shader). sRGB first:
-// an UNORM swapchain makes the image look washed out.
+// an UNORM swapchain makes the image look washed out (KCD1VR trap).
 inline DXGI_FORMAT SelectQuadFormat(DXGI_FORMAT backBufferFormat,
                                     const std::vector<std::int64_t>& supported, bool useSrgb)
 {
