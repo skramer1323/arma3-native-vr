@@ -656,7 +656,7 @@ void OpenXRRuntime::PublishHeadPose()
         sendYaw = static_cast<float>(config.headYawSign) * config.headRotationGain * engineYaw;
         sendPitch =
             static_cast<float>(config.headPitchSign) * config.headRotationGain * enginePitch;
-        // OpenXR +X is right; FreeTrack X is sent mirrored (same as A3VR Hybrid).
+        // Convert the OpenXR right-positive X axis to the FreeTrack sign convention.
         sendShift = -static_cast<float>(eye) * swap * m_stereoShiftMillimeters * m_stereoScale;
     }
     m_poseRing[0].head = location.pose;

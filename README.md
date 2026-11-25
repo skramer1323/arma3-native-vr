@@ -2,6 +2,8 @@
 
 A Windows OpenXR mod for Arma 3 that brings stereoscopic PC VR and headset tracking to first-person gameplay. Keep your normal mouse aim, keyboard bindings and ACE workflows.
 
+Native VR runs in the Arma 3 process through a DLL and requires no additional Arma addons or PBOs.
+
 This is a community preview. I tested it with more than 50 mods in my own setup and found no conflicts during those sessions. Please report any conflicts you find in your modset. — SKRAMER1323
 
 ## Install and launch
@@ -35,6 +37,7 @@ The optional **Apply manual size** control schedules a Windows PowerShell comman
 
 ## Related projects
 
+- [A3VR Hybrid](https://github.com/gborgogno/a3vr-arma3) is an earlier Arma 3 VR project by gborgogno. Its 1.0.2 release came out in August 2026. Give it a try if you prefer aiming and playing with motion controllers.
 - [SnowRunner VR](https://github.com/Timguin-87/Snowrunner-VR) is a reference for VR rendering and resolution handling.
 
 ## License
