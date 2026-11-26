@@ -4,6 +4,7 @@
 
 #include "Config.h"
 #include "EngineStereo.h"
+#include "InventoryLayout.h"
 #include "Log.h"
 #include "ProjectionCache.h"
 
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +47,8 @@ using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const vo
 
 using CreatePixelShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T,
                                                         ID3D11ClassLinkage*, ID3D11PixelShader**);
+using CreateInputLayoutFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*,
+    const D3D11_INPUT_ELEMENT_DESC*, UINT, const void*, SIZE_T, ID3D11InputLayout**);
 
 DrawIndexedFn g_drawIndexed = nullptr;
 DrawFn g_draw = nullptr;
@@ -54,12 +58,17 @@ DrawIndirectFn g_drawIndexedInstancedIndirect = nullptr;
 DrawIndirectFn g_drawInstancedIndirect = nullptr;
 CreateVertexShaderFn g_createVertexShader = nullptr;
 CreatePixelShaderFn g_createPixelShader = nullptr;
+CreateInputLayoutFn g_createInputLayout = nullptr;
 
 constexpr std::size_t kMaxRecords = 60000;
 constexpr std::size_t kMaxSampleBytes = 16U * 1024U * 1024U;
 constexpr UINT kMaxBufferSample = 16384;
 constexpr int kMaxCaptures = 9;
 constexpr UINT kSlots = 5;
+constexpr std::uint64_t kHudSpriteVertex = 0x678df5acc771c4b2ULL;
+constexpr std::uint64_t kHudSpritePixel = 0x749bbcd4bb855b00ULL;
+constexpr std::size_t kMaxHudDraws = 256;
+constexpr UINT kMaxHudElements = 192;
 
 struct TargetInfo {
     void* texture = nullptr;
@@ -104,8 +113,7 @@ std::atomic<bool> g_capturing = false;
 std::mutex g_cullMutex;
 std::unordered_map<void*, std::uint64_t> g_pixelShaderHash;  // pixel shader -> FNV hash of bytecode
 std::atomic<std::uint32_t> g_culledDraws{0};
-// Pixel shaders of the god-ray / sun glow post effect (they use PSC_GodRayPars): frame probe
-// 2026-11-19, game build 2.22.0.154089, hashes as in arma3_vr_shaders\ps_<hash>.dxbc.
+// God-ray pixel shader hashes for Arma 3 build 2.22.0.154089.
 constexpr std::uint64_t kGodRayShaders[] = {0x084b7cb9e89f267dULL, 0xa020fbf71e249da7ULL,
                                             0xaf824b34826d4e08ULL, 0xcedf2729f49513acULL,
                                             0xe2ac5c5ff69e0e8bULL};
@@ -116,6 +124,26 @@ std::unordered_map<void*, std::vector<std::uint8_t>> g_pixelShaderCode;
 using CaptureStack = std::array<void*, 32>;
 CaptureStack g_worldDrawStack{};
 CaptureStack g_weaponDrawStack{};
+struct PositionInput {
+    UINT slot = 0;
+    UINT offset = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+struct HudDrawSample {
+    std::uint32_t draw = 0;
+    UINT first = 0;
+    INT baseVertex = 0;
+    TargetInfo texture;
+    PositionInput position;
+    UINT bufferOffset = 0;
+    UINT stride = 0;
+    DXGI_FORMAT indexFormat = DXGI_FORMAT_UNKNOWN;
+    std::vector<UINT> vertices;
+    std::vector<std::array<float, 4>> values;
+    CaptureStack stack{};
+};
+std::unordered_map<ID3D11InputLayout*, PositionInput> g_positionInputs;
+std::vector<HudDrawSample> g_hudSamples;
 std::vector<DrawRecord> g_records;
 std::vector<BufferSample> g_samples;
 std::size_t g_sampleBytes = 0;
@@ -130,6 +158,8 @@ std::uint32_t g_lastFrameDraws = 0;
 std::uint64_t g_presents = 0;
 ULONGLONG g_firstPresentTick = 0;
 int g_autoCaptures = 0;
+
+std::uint64_t Hash(const std::vector<std::uint8_t>& data);
 
 void DescribeTexture(ID3D11View* view, TargetInfo& info)
 {
@@ -184,7 +214,112 @@ void SampleBuffer(ID3D11DeviceContext* context, ID3D11Buffer* buffer, UINT size,
     g_samples.push_back(std::move(sample));
 }
 
-void Record(ID3D11DeviceContext* context, char kind, UINT count, UINT instances)
+// Snapshot this small range before the game can replace a dynamic vertex buffer with DISCARD.
+bool ReadHudRange(ID3D11DeviceContext* context, ID3D11Buffer* buffer, std::uint64_t offset,
+                  UINT bytes, void* output)
+{
+    if (!buffer || !bytes) return false;
+    D3D11_BUFFER_DESC source{};
+    buffer->GetDesc(&source);
+    if (offset + bytes > source.ByteWidth) return false;
+    auto& staging = g_staging[bytes];
+    if (!staging) {
+        ComPtr<ID3D11Device> device;
+        buffer->GetDevice(&device);
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = bytes;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (!device || FAILED(device->CreateBuffer(&desc, nullptr, &staging))) return false;
+    }
+    const D3D11_BOX range{static_cast<UINT>(offset), 0, 0, static_cast<UINT>(offset + bytes), 1, 1};
+    context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, buffer, 0, &range);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+    std::memcpy(output, mapped.pData, bytes);
+    context->Unmap(staging.Get(), 0);
+    return true;
+}
+
+void SampleHudDraw(ID3D11DeviceContext* context, const DrawRecord& record, UINT first, INT baseVertex)
+{
+    if (record.deferred || (record.kind != 'I' && record.kind != 'D') ||
+        !record.count || record.count > kMaxHudElements || g_hudSamples.size() >= kMaxHudDraws) return;
+    const auto vs = g_vertexShaderCode.find(record.vertexShader);
+    if (vs == g_vertexShaderCode.end() || vs->second.size() != 604 ||
+        Hash(vs->second) != kHudSpriteVertex) return;
+    {
+        std::scoped_lock lock(g_cullMutex);
+        const auto ps = g_pixelShaderHash.find(record.pixelShader);
+        if (ps == g_pixelShaderHash.end() || ps->second != kHudSpritePixel) return;
+    }
+
+    auto& sample = g_hudSamples.emplace_back();
+    sample.draw = static_cast<std::uint32_t>(g_records.size());
+    sample.first = first;
+    sample.baseVertex = baseVertex;
+    ComPtr<ID3D11ShaderResourceView> texture;
+    context->PSGetShaderResources(0, 1, &texture);
+    if (texture) {
+        DescribeTexture(texture.Get(), sample.texture);
+        D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+        texture->GetDesc(&desc);
+        sample.texture.viewFormat = desc.Format;
+    }
+    if (GetConfig().detailedCapture) {
+        CaptureStackBackTrace(0, static_cast<DWORD>(sample.stack.size()), sample.stack.data(), nullptr);
+    }
+
+    ComPtr<ID3D11InputLayout> layout;
+    context->IAGetInputLayout(&layout);
+    const auto position = g_positionInputs.find(layout.Get());
+    if (position == g_positionInputs.end()) return;
+    sample.position = position->second;
+    if (sample.position.format != DXGI_FORMAT_R32G32B32A32_FLOAT) return;
+    ComPtr<ID3D11Buffer> vertex;
+    context->IAGetVertexBuffers(sample.position.slot, 1, vertex.GetAddressOf(),
+                                &sample.stride, &sample.bufferOffset);
+    if (sample.stride > 256 || sample.position.offset > sample.stride ||
+        sample.stride - sample.position.offset < sizeof(std::array<float, 4>)) return;
+
+    std::array<std::uint8_t, kMaxHudElements * sizeof(std::uint32_t)> indexBytes{};
+    UINT indexSize = 0;
+    if (record.kind == 'I') {
+        ComPtr<ID3D11Buffer> index;
+        UINT indexOffset = 0;
+        context->IAGetIndexBuffer(&index, &sample.indexFormat, &indexOffset);
+        if (sample.indexFormat == DXGI_FORMAT_R32_UINT) indexSize = 4;
+        if (sample.indexFormat == DXGI_FORMAT_R16_UINT) indexSize = 2;
+        if (!indexSize || !ReadHudRange(context, index.Get(),
+                indexOffset + static_cast<std::uint64_t>(first) * indexSize,
+                record.count * indexSize, indexBytes.data())) return;
+    }
+    for (UINT i = 0; i < record.count; ++i) {
+        UINT element = i;
+        if (indexSize) {
+            element = 0;
+            std::memcpy(&element, indexBytes.data() + i * indexSize, indexSize);
+        }
+        const auto vertexIndex = static_cast<std::int64_t>(element) + (indexSize ? baseVertex :
+                                                                     static_cast<std::int64_t>(first));
+        if (vertexIndex < 0 || vertexIndex > UINT_MAX) return;
+        sample.vertices.push_back(static_cast<UINT>(vertexIndex));
+    }
+    const auto [low, high] = std::minmax_element(sample.vertices.begin(), sample.vertices.end());
+    if (*high - *low >= 128) return;
+    const UINT bytes = (*high - *low) * sample.stride + sizeof(std::array<float, 4>);
+    const auto offset = sample.bufferOffset + static_cast<std::uint64_t>(*low) * sample.stride +
+                        sample.position.offset;
+    std::vector<std::uint8_t> valueBytes(bytes);
+    if (!ReadHudRange(context, vertex.Get(), offset, bytes, valueBytes.data())) return;
+    for (const UINT index : sample.vertices) {
+        auto& value = sample.values.emplace_back();
+        std::memcpy(value.data(), valueBytes.data() + (index - *low) * sample.stride, sizeof(value));
+    }
+}
+
+void Record(ID3D11DeviceContext* context, char kind, UINT count, UINT instances,
+            UINT first = 0, INT baseVertex = 0)
 {
     g_drawsThisFrame.fetch_add(1, std::memory_order_relaxed);
     if (PerfGpuPassWantsDraw(context)) {
@@ -324,6 +459,9 @@ void Record(ID3D11DeviceContext* context, char kind, UINT count, UINT instances)
         }
         buffers[slot]->Release();
     }
+    if (GetConfig().detailedCapture || EngineStereoTargetIsBackBuffer(context)) {
+        SampleHudDraw(context, record, first, baseVertex);
+    }
     g_records.push_back(record);
 }
 
@@ -383,7 +521,8 @@ void RegisterBrowseShader(ID3D11DeviceContext* context, std::uint64_t hash)
 // selected kind and must be skipped.
 bool UiBrowseCulls(ID3D11DeviceContext* context, std::uint64_t hash)
 {
-    if (!EngineStereoTargetIsBackBuffer(context)) {
+    constexpr std::uint64_t sceneComposite = 0xe989f48536e7c553ULL;
+    if (hash == sceneComposite || !EngineStereoTargetIsBackBuffer(context)) {
         return false;
     }
     BrowseShader kind;
@@ -429,11 +568,210 @@ bool BrowseCulls(std::uint64_t hash)
     return g_browseIndex >= 0 && g_browseIndex < static_cast<int>(g_catalog.size()) &&
            g_catalog[static_cast<size_t>(g_browseIndex)].hash == hash;
 }
-// True for a small screen-space draw of the god-ray effect into the scene colour target.
-bool ShouldCullDraw(ID3D11DeviceContext* context, UINT elementCount)
+
+// The stock head-mounted NVGs and ENVG share weapons_f/data/nightvisiontl.paa.
+// Identify its BC3 blocks, since other optics share the same HUD shader and dimensions.
+bool IsNightVisionMask(ID3D11DeviceContext* context)
 {
-    if (elementCount > 6 ||
-        (!g_browse.load() && !GetConfig().cullGodRays && GetConfig().cullHashes.empty()) ||
+    using Microsoft::WRL::ComPtr;
+    constexpr UINT mip = 3;
+    constexpr UINT mipExtent = 128;
+    constexpr UINT blockRows = mipExtent / 4;
+    constexpr UINT rowBytes = blockRows * 16;
+    constexpr std::uint64_t maskHash = 0xefdaac706f850e54ULL;
+    constexpr GUID textureTag{0x9018a120, 0xb2f8, 0x41c4, {0x94, 0xcd, 0x4c, 0x51, 0xa9, 0x74, 0xc1, 0xd2}};
+    static ComPtr<ID3D11Texture2D> pending;
+    static ComPtr<ID3D11Texture2D> readback;
+
+    ComPtr<ID3D11ShaderResourceView> srv;
+    context->PSGetShaderResources(0, 1, &srv);
+    if (!srv) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+    srv->GetDesc(&view);
+    if (view.Format != DXGI_FORMAT_BC3_UNORM || view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
+        view.Texture2D.MostDetailedMip != 0) return false;
+
+    ComPtr<ID3D11Resource> resource;
+    ComPtr<ID3D11Texture2D> texture;
+    srv->GetResource(&resource);
+    if (FAILED(resource.As(&texture))) return false;
+    D3D11_TEXTURE2D_DESC description{};
+    texture->GetDesc(&description);
+    if (description.Width != 1024 || description.Height != 1024 || description.MipLevels <= mip ||
+        description.BindFlags != D3D11_BIND_SHADER_RESOURCE ||
+        (description.Usage != D3D11_USAGE_DEFAULT && description.Usage != D3D11_USAGE_IMMUTABLE)) return false;
+
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (readback) {
+        ComPtr<ID3D11Device> readbackDevice;
+        readback->GetDevice(&readbackDevice);
+        if (readbackDevice.Get() != device.Get()) {
+            pending.Reset();
+            readback.Reset();
+        }
+    }
+
+    if (pending) {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const HRESULT result = context->Map(readback.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (SUCCEEDED(result)) {
+            const auto* bytes = static_cast<const std::uint8_t*>(mapped.pData);
+            std::uint64_t hash = 14695981039346656037ULL;
+            for (UINT row = 0; row < blockRows; ++row) {
+                for (UINT column = 0; column < rowBytes; ++column) {
+                    hash = (hash ^ bytes[row * mapped.RowPitch + column]) * 1099511628211ULL;
+                }
+            }
+            context->Unmap(readback.Get(), 0);
+            const std::uint8_t match = hash == maskHash;
+            pending->SetPrivateData(textureTag, sizeof(match), &match);
+            if (match) Log("NVG: matched stock circular mask texture");
+            pending.Reset();
+        } else if (result != DXGI_ERROR_WAS_STILL_DRAWING) {
+            pending.Reset();
+            readback.Reset();
+        }
+    }
+
+    std::uint8_t match = 0;
+    UINT tagSize = sizeof(match);
+    if (SUCCEEDED(texture->GetPrivateData(textureTag, &tagSize, &match))) return match != 0;
+    if (pending) return false;
+    if (!readback) {
+        D3D11_TEXTURE2D_DESC staging{};
+        staging.Width = staging.Height = mipExtent;
+        staging.MipLevels = staging.ArraySize = staging.SampleDesc.Count = 1;
+        staging.Format = DXGI_FORMAT_BC3_TYPELESS;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(device->CreateTexture2D(&staging, nullptr, &readback))) return false;
+    }
+    context->CopySubresourceRegion(readback.Get(), 0, 0, 0, 0, texture.Get(), mip, nullptr);
+    pending = texture;
+    return false;
+}
+
+bool InventoryButtonBounds(ID3D11DeviceContext* context, UINT first, INT baseVertex)
+{
+    std::scoped_lock lock(g_mutex);
+    ComPtr<ID3D11InputLayout> layout;
+    context->IAGetInputLayout(&layout);
+    const auto position = g_positionInputs.find(layout.Get());
+    if (position == g_positionInputs.end()) return false;
+
+    ComPtr<ID3D11Buffer> indices;
+    DXGI_FORMAT indexFormat{};
+    UINT indexOffset = 0;
+    context->IAGetIndexBuffer(&indices, &indexFormat, &indexOffset);
+    // The sprite batch uses 16-bit indices, including for the inventory button.
+    std::array<std::uint16_t, 3> triangle{};
+    if (indexFormat != DXGI_FORMAT_R16_UINT || !ReadHudRange(context, indices.Get(),
+            indexOffset + static_cast<std::uint64_t>(first) * sizeof(triangle[0]),
+            sizeof(triangle), triangle.data())) return false;
+
+    ComPtr<ID3D11Buffer> vertices;
+    UINT stride = 0, vertexOffset = 0;
+    context->IAGetVertexBuffers(position->second.slot, 1, vertices.GetAddressOf(), &stride, &vertexOffset);
+    const auto [lo, hi] = std::minmax_element(triangle.begin(), triangle.end());
+    const auto firstVertex = static_cast<std::int64_t>(*lo) + baseVertex;
+    const UINT offset = position->second.offset;
+    if (firstVertex < 0 || *hi - *lo > 3 || stride > 64 || offset > stride || stride - offset < 8) return false;
+    std::array<std::uint8_t, 4 * 64> bytes{};
+    if (!ReadHudRange(context, vertices.Get(), vertexOffset + firstVertex * stride + offset,
+                      (*hi - *lo) * stride + 8, bytes.data())) return false;
+    std::array<float, 3> x{}, y{};
+    for (size_t i = 0; i < triangle.size(); ++i) {
+        const auto* xy = bytes.data() + (triangle[i] - *lo) * stride;
+        std::memcpy(&x[i], xy, sizeof(float));
+        std::memcpy(&y[i], xy + sizeof(float), sizeof(float));
+    }
+    const auto [left, right] = std::minmax_element(x.begin(), x.end());
+    const auto [bottom, top] = std::minmax_element(y.begin(), y.end());
+    return IsInventoryCloseButton(*left, *top, *right, *bottom);
+}
+
+void NoteInventoryButton(ID3D11DeviceContext* context, UINT first, INT baseVertex)
+{
+    const auto frame = EngineStereoFrameId();
+    static std::uint64_t cursorFrame = 0;
+    static bool haveCursor = false;
+    if (cursorFrame != frame) {
+        CURSORINFO cursor{sizeof(cursor)};
+        haveCursor = GetCursorInfo(&cursor) && (cursor.flags & CURSOR_SHOWING) != 0;
+        cursorFrame = frame;
+    }
+    if (!haveCursor && !EngineStereoLastInventoryDraw()) return;
+
+    ComPtr<ID3D11ShaderResourceView> srv;
+    context->PSGetShaderResources(0, 1, &srv);
+    if (!srv) return;
+    D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+    srv->GetDesc(&view);
+    if (view.Format != DXGI_FORMAT_BC3_UNORM || view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
+        view.Texture2D.MostDetailedMip != 0) return;
+    ComPtr<ID3D11Resource> resource;
+    ComPtr<ID3D11Texture2D> texture;
+    srv->GetResource(&resource);
+    if (FAILED(resource.As(&texture))) return;
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (desc.Width != 64 || desc.Height != 64 || !EngineStereoTargetIsBackBuffer(context)) return;
+
+    // icon_exit_cross_ca.paa, top 64x64 BC3 mip. Memoise immutable UI texture identity.
+    constexpr GUID closeIconTag{0x9a86c46c, 0x5e28, 0x4d16, {0xa0, 0x78, 0xf8, 0x11, 0x62, 0xcb, 0x45, 0xb2}};
+    std::uint8_t closeIcon = 0;
+    UINT tagSize = sizeof(closeIcon);
+    if (FAILED(texture->GetPrivateData(closeIconTag, &tagSize, &closeIcon))) {
+        ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        D3D11_TEXTURE2D_DESC readback{};
+        readback.Width = readback.Height = 64;
+        readback.MipLevels = readback.ArraySize = readback.SampleDesc.Count = 1;
+        readback.Usage = D3D11_USAGE_STAGING;
+        readback.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        readback.Format = DXGI_FORMAT_BC3_TYPELESS;
+        ComPtr<ID3D11Texture2D> staging;
+        if (FAILED(device->CreateTexture2D(&readback, nullptr, &staging))) return;
+        context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, texture.Get(), 0, nullptr);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
+        const auto* bytes = static_cast<const std::uint8_t*>(mapped.pData);
+        std::uint64_t hash = 14695981039346656037ULL;
+        for (UINT row = 0; row < 16; ++row) {
+            for (UINT col = 0; col < 256; ++col) {
+                hash = (hash ^ bytes[row * mapped.RowPitch + col]) * 1099511628211ULL;
+            }
+        }
+        context->Unmap(staging.Get(), 0);
+        closeIcon = hash == 0x2c67db1127f36b12ULL;
+        texture->SetPrivateData(closeIconTag, sizeof(closeIcon), &closeIcon);
+    }
+    if (!closeIcon) return;
+
+    // Read geometry once per continuous display. A missing button ends the match.
+    static std::uint64_t lastButtonFrame = 0;
+    static bool matchesLayout = false;
+    if (frame != lastButtonFrame && frame != lastButtonFrame + 1) {
+        matchesLayout = InventoryButtonBounds(context, first, baseVertex);
+        Log("Inventory VR: native close button, inventory layout %s", matchesLayout ? "matched" : "absent");
+    }
+    lastButtonFrame = frame;
+    if (matchesLayout) EngineStereoNoteInventoryDraw();
+}
+
+struct IndexedDrawRange { UINT first; INT baseVertex; };
+
+// Inspect small screen-space draws for the configured filters and the inventory overlay.
+bool ShouldCullDraw(ID3D11DeviceContext* context, UINT elementCount, const IndexedDrawRange* indexed = nullptr)
+{
+    const bool inventoryProbe = indexed && elementCount == 6 && GetConfig().inventoryInVr &&
+                                GetConfig().virtualBackBuffer && EngineStereoActive();
+    const int browseMode = g_browseMode.load();
+    const bool browseHudBatch = elementCount > 6 && browseMode == 2 && EngineStereoTargetIsBackBuffer(context);
+    if ((elementCount > 6 && !browseHudBatch) ||
+        (!g_browse.load() && !GetConfig().cullGodRays && GetConfig().cullHashes.empty() &&
+         !GetConfig().hideNightVisionMask && !inventoryProbe) ||
         context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) {
         return false;
     }
@@ -453,14 +791,19 @@ bool ShouldCullDraw(ID3D11DeviceContext* context, UINT elementCount)
         }
     }
     pixelShader->Release();
-    if (known && g_browseMode.load() == 1) {
+    if (inventoryProbe && hash == kHudSpritePixel) {
+        NoteInventoryButton(context, indexed->first, indexed->baseVertex);
+    }
+    if (known && browseMode == 1) {
         RegisterBrowseShader(context, hash);
         if (BrowseCulls(hash)) {
             return true;
         }
-    } else if (known && g_browseMode.load() == 2 && UiBrowseCulls(context, hash)) {
+    } else if (known && browseMode == 2 && UiBrowseCulls(context, hash)) {
         return true;
     }
+    // The larger batches are inspected only by the HUD browser.
+    if (elementCount > 6) return false;
     if (known) {
         const auto& list = GetConfig().cullHashes;
         if (std::find(list.begin(), list.end(), hash) != list.end()) {
@@ -472,12 +815,16 @@ bool ShouldCullDraw(ID3D11DeviceContext* context, UINT elementCount)
             return true;
         }
     }
+    if (elementCount == 6 && hash == kHudSpritePixel && GetConfig().hideNightVisionMask &&
+        EngineStereoPerfWorld() && EngineStereoTargetIsBackBuffer(context) && IsNightVisionMask(context)) {
+        return true;
+    }
     if (!known || !GetConfig().cullGodRays ||
         std::find(std::begin(kGodRayShaders), std::end(kGodRayShaders), hash) ==
             std::end(kGodRayShaders)) {
         return false;
     }
-    bool sceneColour = false;
+    DXGI_FORMAT sceneFormat = DXGI_FORMAT_UNKNOWN;
     ID3D11RenderTargetView* rtv = nullptr;
     context->OMGetRenderTargets(1, &rtv, nullptr);
     if (rtv) {
@@ -490,16 +837,23 @@ bool ShouldCullDraw(ID3D11DeviceContext* context, UINT elementCount)
             unsigned sceneWidth = 0;
             unsigned sceneHeight = 0;
             EngineStereoSceneSize(sceneWidth, sceneHeight);
-            sceneColour = description.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
-                          description.Width == sceneWidth && description.Height == sceneHeight;
+            if (description.Width == sceneWidth && description.Height == sceneHeight) {
+                // The final additive pass also writes to the packed HDR scene on R32.
+                // Its smaller working textures feed other passes and must still be produced.
+                sceneFormat = description.Format;
+            }
         }
         rtv->Release();
     }
+    const bool packedHdr = sceneFormat == DXGI_FORMAT_R10G10B10A2_UNORM && EngineStereoPerfWorld();
+    const bool sceneColour = sceneFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || packedHdr;
     if (sceneColour) {
+        static std::atomic<bool> loggedPackedHdr{false};
+        const bool firstPackedHdr = packedHdr && !loggedPackedHdr.exchange(true);
         const std::uint32_t count = g_culledDraws.fetch_add(1) + 1;
-        if (count == 1 || count % 3000 == 0) {
-            Log("CULL god-ray draw skipped (shader %016llx), %u so far",
-                static_cast<unsigned long long>(hash), count);
+        if (firstPackedHdr || count == 1 || count % 3000 == 0) {
+            Log("CULL god-ray draw skipped (shader %016llx, scene format %d), %u so far",
+                static_cast<unsigned long long>(hash), static_cast<int>(sceneFormat), count);
         }
     }
     return sceneColour;
@@ -508,11 +862,12 @@ bool ShouldCullDraw(ID3D11DeviceContext* context, UINT elementCount)
 void STDMETHODCALLTYPE HookDrawIndexed(ID3D11DeviceContext* context, UINT indexCount,
                                        UINT startIndex, INT baseVertex)
 {
-    if (ShouldCullDraw(context, indexCount)) {
+    const IndexedDrawRange range{startIndex, baseVertex};
+    if (ShouldCullDraw(context, indexCount, &range)) {
         return;
     }
     PerfDrawScope perf;
-    Record(context, 'I', indexCount, 1);
+    Record(context, 'I', indexCount, 1, startIndex, baseVertex);
     StereoDraw stereo(context, indexCount, false);
     perf.AfterBegin();
     g_drawIndexed(context, indexCount, startIndex, baseVertex);
@@ -531,7 +886,7 @@ void STDMETHODCALLTYPE HookDraw(ID3D11DeviceContext* context, UINT vertexCount, 
         return;
     }
     PerfDrawScope perf;
-    Record(context, 'D', vertexCount, 1);
+    Record(context, 'D', vertexCount, 1, startVertex);
     StereoDraw stereo(context, vertexCount, false);
     perf.AfterBegin();
     g_draw(context, vertexCount, startVertex);
@@ -649,11 +1004,44 @@ HRESULT STDMETHODCALLTYPE HookCreatePixelShader(ID3D11Device* device, const void
             std::scoped_lock cullLock(g_cullMutex);
             g_pixelShaderHash[*shader] = hash;
         }
-        EngineStereoNotePixelShader(*shader, hash);
+        EngineStereoNotePixelShader(*shader, bytecode, length, hash);
         if (GetConfig().detailedCapture) {
             std::scoped_lock lock(g_mutex);
             g_pixelShaderCode[*shader].assign(bytes, bytes + length);
         }
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateInputLayout(ID3D11Device* device,
+    const D3D11_INPUT_ELEMENT_DESC* elements, UINT count, const void* bytecode,
+    SIZE_T length, ID3D11InputLayout** layout)
+{
+    const HRESULT result = g_createInputLayout(device, elements, count, bytecode, length, layout);
+    if (FAILED(result) || !layout || !*layout || !elements) return result;
+
+    PositionInput position;
+    const auto* end = elements + count;
+    for (const auto* element = elements; element != end; ++element) {
+        if (!element->SemanticName || element->SemanticIndex != 0 ||
+            _stricmp(element->SemanticName, "POSITION") != 0 ||
+            element->InputSlotClass != D3D11_INPUT_PER_VERTEX_DATA) continue;
+        UINT offset = element->AlignedByteOffset;
+        if (offset == D3D11_APPEND_ALIGNED_ELEMENT) {
+            const bool firstInSlot = std::none_of(elements, element, [&](const auto& previous) {
+                return previous.InputSlot == element->InputSlot;
+            });
+            if (!firstInSlot) break;
+            offset = 0;
+        }
+        position = {element->InputSlot, offset, element->Format};
+        break;
+    }
+    std::scoped_lock lock(g_mutex);
+    if (position.format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+        g_positionInputs[*layout] = position;
+    } else {
+        g_positionInputs.erase(*layout);
     }
     return result;
 }
@@ -894,13 +1282,42 @@ void WriteStack(FILE* file, const char* label, const CaptureStack& stack)
     }
 }
 
+void WriteHudSamples(FILE* file, const std::vector<HudDrawSample>& samples,
+                     const std::vector<DrawRecord>& records)
+{
+    std::fprintf(file, "\n==== HUD sprite draw samples (%zu matches, limit %zu) ====\n",
+                 samples.size(), kMaxHudDraws);
+    for (const auto& sample : samples) {
+        const auto& record = records[sample.draw];
+        std::fprintf(file, "HUD draw %u kind=%c count=%u first=%u base=%d indexFormat=%u "
+                           "t0=%p t0Size=%ux%u t0Fmt=%u viewFmt=%u "
+                           "slot=%u positionOffset=%u stride=%u bufferOffset=%u positionFmt=%u values=%zu\n",
+                     sample.draw, record.kind, record.count, sample.first, sample.baseVertex,
+                     static_cast<UINT>(sample.indexFormat), sample.texture.texture, sample.texture.width,
+                     sample.texture.height, sample.texture.format, sample.texture.viewFormat,
+                     sample.position.slot, sample.position.offset, sample.stride, sample.bufferOffset,
+                     static_cast<UINT>(sample.position.format), sample.values.size());
+        for (std::size_t i = 0; i < sample.vertices.size(); ++i) {
+            std::fprintf(file, "  vertexIndex=%u", sample.vertices[i]);
+            if (i < sample.values.size()) {
+                const auto& v = sample.values[i];
+                std::fprintf(file, " x=%+.9g y=%+.9g z=%+.9g w=%+.9g", v[0], v[1], v[2], v[3]);
+            }
+            std::fputc('\n', file);
+        }
+        if (sample.stack[0]) WriteStack(file, "HUD sprite", sample.stack);
+    }
+}
+
 // Present thread, capture already stopped.
 void WriteCapture(IDXGISwapChain* swapChain)
 {
     std::vector<DrawRecord> records;
     std::vector<BufferSample> samples;
+    std::vector<HudDrawSample> hudSamples;
     std::unordered_map<void*, std::vector<std::uint8_t>> code;
     std::unordered_map<void*, std::vector<std::uint8_t>> pixelCode;
+    std::unordered_map<void*, std::uint64_t> pixelHashes;
     CaptureStack worldDrawStack{};
     CaptureStack weaponDrawStack{};
     bool dropped = false;
@@ -908,6 +1325,7 @@ void WriteCapture(IDXGISwapChain* swapChain)
         std::scoped_lock lock(g_mutex);
         records.swap(g_records);
         samples.swap(g_samples);
+        hudSamples.swap(g_hudSamples);
         g_sampled.clear();
         g_staging.clear();
         g_sampleBytes = 0;
@@ -924,6 +1342,13 @@ void WriteCapture(IDXGISwapChain* swapChain)
             if (found != g_vertexShaderCode.end()) {
                 code.emplace(record.vertexShader, found->second);
             }
+        }
+    }
+    {
+        std::scoped_lock lock(g_cullMutex);
+        for (const DrawRecord& record : records) {
+            const auto found = g_pixelShaderHash.find(record.pixelShader);
+            if (found != g_pixelShaderHash.end()) pixelHashes.try_emplace(found->first, found->second);
         }
     }
     ++g_captures;
@@ -1118,6 +1543,26 @@ void WriteCapture(IDXGISwapChain* swapChain)
         }
     }
 
+    if (!hudSamples.empty()) {
+        WriteHudSamples(file, hudSamples, records);
+        const auto readableHudDraws = std::count_if(hudSamples.begin(), hudSamples.end(),
+            [](const HudDrawSample& sample) { return !sample.values.empty(); });
+        Log("HUD probe frame %d: %zu matched sprite draws, %zu with POSITION.xyzw",
+            g_captures, hudSamples.size(), static_cast<std::size_t>(readableHudDraws));
+    }
+
+    std::fprintf(file, "\n==== draws and shader hashes ====\n");
+    std::fprintf(file, "draw kind elements instances VS PS PS_hash RT DS viewport depth_range\n");
+    for (std::size_t draw = 0; draw < records.size(); ++draw) {
+        const auto& record = records[draw];
+        const auto pixel = pixelHashes.find(record.pixelShader);
+        const auto hash = pixel == pixelHashes.end() ? 0ULL : static_cast<unsigned long long>(pixel->second);
+        std::fprintf(file, "%zu %c %u %u VS%d %p %016llx T%d T%d %.0fx%.0f %.6f..%.6f\n",
+                     draw, record.kind, record.count, record.instances, shaders[record.vertexShader].id,
+                     record.pixelShader, hash, textureId(record.target0.texture), textureId(record.depth.texture),
+                     record.viewport[2], record.viewport[3], record.depthRange[0], record.depthRange[1]);
+    }
+
     std::fprintf(file, "\n==== constant buffer samples (data in .cb.bin) ====\n");
     FILE* binary = nullptr;
     _wfopen_s(&binary, (base.wstring() + L".cb.bin").c_str(), L"wb");
@@ -1189,9 +1634,13 @@ bool InstallFrameProbe(ID3D11Device* anyDevice, ID3D11DeviceContext* anyContext)
                       "DrawInstancedIndirect");
     installed &= Hook(device[12], reinterpret_cast<void*>(&HookCreateVertexShader),
                       reinterpret_cast<void**>(&g_createVertexShader), "CreateVertexShader");
-    if (GetConfig().detailedCapture || GetConfig().cullGodRays) {
-        installed &= Hook(device[15], reinterpret_cast<void*>(&HookCreatePixelShader),
-                          reinterpret_cast<void**>(&g_createPixelShader), "CreatePixelShader");
+    // VRS can be enabled after the game has created its material shaders.
+    installed &= Hook(device[15], reinterpret_cast<void*>(&HookCreatePixelShader),
+                      reinterpret_cast<void**>(&g_createPixelShader), "CreatePixelShader");
+    if (GetConfig().detailedCapture || GetConfig().inventoryInVr) {
+        const bool hudInputs = Hook(device[11], reinterpret_cast<void*>(&HookCreateInputLayout),
+                                    reinterpret_cast<void**>(&g_createInputLayout), "CreateInputLayout");
+        Log("HUD probe vertex layout hook: %s", hudInputs ? "installed" : "unavailable");
     }
     if (GetConfig().cacheStereoProjection && GetConfig().engineStereo) {
         InstallProjectionHooks(anyContext);

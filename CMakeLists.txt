@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(Arma3NativeVR VERSION 0.2.0 LANGUAGES C CXX)
+project(Arma3NativeVR VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,6 +55,7 @@ option(ARMA_WITH_DLSS "Build the experimental DLSS path" OFF)
 add_library(Arma3NativeVR SHARED
     src/DlssBalanced.cpp
     src/DlssWorld.cpp
+    src/StereoCas.cpp
     src/Calibration.cpp
     src/Calibration.h
     src/Config.cpp
@@ -96,6 +97,18 @@ add_library(Arma3NativeVR SHARED
     src/QuadMath.h
     src/dinput8.def
 )
+
+find_program(ARMA_FXC fxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
+set(cas_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx-cas")
+set(cas_shader "${CMAKE_CURRENT_SOURCE_DIR}/src/StereoCas.hlsl")
+set(cas_bytecode "${CMAKE_CURRENT_BINARY_DIR}/StereoCasShader.h")
+add_custom_command(OUTPUT "${cas_bytecode}"
+    COMMAND "${ARMA_FXC}" /nologo /O3 /T cs_5_0 /E Sharpen /I "${cas_dir}"
+        /Fh "${cas_bytecode}" /Vn kStereoCas "${cas_shader}"
+    DEPENDS "${cas_shader}" "${cas_dir}/ffx_a.h" "${cas_dir}/ffx_cas.h"
+    VERBATIM)
+target_sources(Arma3NativeVR PRIVATE "${cas_bytecode}")
+target_include_directories(Arma3NativeVR PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 target_compile_definitions(Arma3NativeVR PRIVATE
     ARMA_NATIVE_VR_VERSION="${PROJECT_VERSION}"

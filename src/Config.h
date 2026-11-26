@@ -10,10 +10,9 @@ enum class AerWarpMode { Off, HeadsetRotation, CameraRotation, Camera6DoF };
 
 // Every behaviour has an INI key in arma3_native_vr.ini, section [ArmaVR].
 struct Config {
-    // 0 = proxy only: log the D3D11 device and swapchain, no OpenXR (rung 1).
+    // When disabled, the proxy logs graphics initialization without starting OpenXR.
     bool enableVR = true;
-    // 0 = back buffer on a quad (rung 3), 1 = empty frames (rung 2),
-    // 2 = session only, no frame loop.
+    // 0 = normal output, 1 = empty frames, 2 = session with no frame loop.
     int openXrDiagnosticMode = 0;
     // 0 = head-locked quad (VIEW space), 1 = world-fixed quad (LOCAL space).
     int quadAnchor = 0;
@@ -34,8 +33,7 @@ struct Config {
     float weaponSize = 0.6F;  // projection layer: size of the weapon layer on the picture
     // Show the frame with the head pose the engine actually received (matched by dataId).
     bool poseBySequence = true;
-    // World view with engine stereo: draw each eye with the headset's own frustum and submit a
-    // projection layer (like Tarkov KBM VR) instead of a window (quad) showing the game picture.
+    // Draw each eye with the headset's frustum for the OpenXR projection layer.
     bool projectionLayer = true;
     bool steamVrWorldQuad = true;
     bool steamVrMirrorHud = false;
@@ -44,11 +42,8 @@ struct Config {
     bool dibrForwardHistory = false;
     AerWarpMode aerWarpMode = AerWarpMode::Camera6DoF;
     int aerDibrPreference = 0;  // 0 off, 1 DIBR, 2 DIBR with forward history
-    // AER with the engine's own projection and the whole target per eye (SnowRunner-style): every
-    // screen-space effect (shadows, AO, glow) is computed for one normal camera. Needs AER on.
-    // Port of the SnowRunner VR mod: the game window is made exactly this client size (the headset's
-    // per-eye resolution) so the game renders one eye per frame at 1:1 pixels. 0 = off. Windowed
-    // mode needed. Automatic sizing uses the runtime's recommended eye extent.
+    // Frame sizing in windowed mode. With a virtual back buffer the desktop size is independent.
+    // The legacy window sizing path adapts the approach from SnowRunner VR (MIT).
     bool autoHeadsetResolution = true;
     int forceGameWidth = 0;
     int forceGameHeight = 0;
@@ -61,12 +56,12 @@ struct Config {
     // Menus, map and inventory (cursor shown) are drawn as one normal frame shown on the flat screen,
     // not as two doubled halves: the screen-space effects of the 3D menu background stay correct.
     bool monoScreen = true;
+    bool inventoryInVr = true;
     // Use the engine's full 3D scene as the OpenXR source and keep the game window independent.
     bool virtualBackBuffer = false;
     int dibrFillMode = 1;  // DIBR holes: 0 magenta, 1 stale eye then background, 2 background only
-    // Aiming (as in the Tarkov KBM VR mod): while aiming the view follows the game camera (the
-    // sight line); only the head motion since aiming started turns it further. AimEye: the eye
-    // that is put on the sight line (1 right, -1 left, 0 between the eyes).
+    // While aiming, apply head motion relative to the sight line at the start of aim.
+    // AimEye selects the right eye (1), left eye (-1), or the midpoint (0).
     bool adsLockView = true;
     bool adsRightMouseToggle = false;
     int aimEye = 1;
@@ -77,8 +72,6 @@ struct Config {
     // millimetre sent (signed, measured by the calibration, F8); 0 = take it from the live
     // calibration of this session. Frame: 0 = body (recentre direction), 1 = looking direction.
     // Anchor the extra weapon distance to the body's aim direction. Arma supplies the pose.
-    // M22/M32: depth constants of the weapon layer's projection
-    // (frame probe 2026-11-17: 1.00002 / -0.01).
     bool weaponBodyLock = true;
     float headOffset[3]{0.0F, 0.0F, 0.0F};  // saved head placement (Ctrl+arrows, Ctrl+Delete)
     // Head placement inside a vehicle (the roof is lower): same keys, saved with Ctrl+Delete.
@@ -87,11 +80,7 @@ struct Config {
                                // cockpit is also drawn in that layer, so it is off; Ctrl+Insert switches)
     int headPlacementMode = 0;  // 0 configured default, 1 on foot, 2 vehicle
     bool weaponHeadPosition = false;  // Same-frame stereo head lean for inspecting on foot.
-    // The 2D HUD is drawn once into its own texture and shown as an OpenXR quad fixed in the room
-    // in front of the recentre direction (Tarkov KBM VR HudLayer): no doubling, no bending.
-    // The sun/god-ray post effect is computed once over the whole side-by-side picture, so its glow
-    // sits on the seam (left eye sees it on the right, right eye on the left). Its draws into the
-    // scene colour target are skipped (frame probe 2026-11-19).
+    // Skip the screen-space glare pass that places the sun differently in the two eyes.
     bool cullGodRays = true;
     // Diagnostic: pixel-shader hashes (hex, comma separated, "CullHashes=") whose small screen-space
     // draws are skipped, to find which post effect breaks the side-by-side picture.
@@ -99,7 +88,7 @@ struct Config {
     // Scope = lens: with a magnifying optic (game zoom > 1.03) only a round-ish window of
     // scopeLensDegrees apparent field is shown, magnified by the real zoom, the reticle drawn in
     // the picture; the surroundings are black (a scope tube) and the 2D HUD panel is hidden.
-    bool scopeLens = false;  // off: the GPT full-field zoom is the default (user preference)
+    bool scopeLens = false;  // Full-field zoom is the default.
     float scopeLensDegrees = 30.0F;
     bool scopeReticle = true;  // with any magnifying optic the reticle is drawn at the aim axis in the picture
     // Through a magnifying optic the head does not move the view at all (rotation and position are
@@ -109,6 +98,7 @@ struct Config {
     // eyes, centred), so the sight can be used with both eyes open.
     bool scopeWeaponFlat = true;
     bool hudQuad = true;
+    bool hideNightVisionMask = true;
     bool hideGameplayHud = false;
     bool hudBodyLock = true;  // the 2D HUD stays where the body aims too
     bool stabilizeHudMarker = false;
@@ -117,6 +107,10 @@ struct Config {
     bool staleEyeWarp = false;
     bool stereoShadows = true;
     bool worldVrs = false;
+    int worldVrsInnerDegrees = 35;
+    bool worldVrsCoarseOuter = false;
+    bool worldVrsShowRings = false;
+    int casSharpnessPercent = 0;
     bool singlePassDepth = false;
     bool singlePassWorldPrepass = false;
     float weaponProjM22 = 1.00002F;

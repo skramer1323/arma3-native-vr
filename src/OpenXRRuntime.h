@@ -3,6 +3,7 @@
 #include "Dibr.h"
 #include "DlssWorld.h"
 #include "StaleEyeWarp.h"
+#include "StereoCas.h"
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace a3vr {
@@ -37,6 +39,7 @@ public:
     // Called before the game's Present reaches DXGI.
     // True when the next OpenXR wait should run after DXGI Present returns.
     bool OnPresent(IDXGISwapChain* swapChain);
+    bool IsMainSwapChain(IDXGISwapChain* swapChain);
     void OnAfterPresent(IDXGISwapChain* swapChain, double desktopPresentMs, UINT syncInterval);
     // Called before the game's ResizeBuffers reaches DXGI.
     void OnResize(IDXGISwapChain* swapChain, UINT width, UINT height);
@@ -46,6 +49,7 @@ private:
     bool CreateSession();
     void DestroySession();
     void PollEvents();
+    void ReadWorldVisibility(const XrView (&views)[2], XrQuaternionf headOrientation);
     void ApplyLocalSpaceChanges();
     void HandleSessionState(XrSessionState state);
     void PrepareNextFrame();
@@ -56,11 +60,18 @@ private:
     void WriteEyeImages(ID3D11Texture2D* frame, int renderedEye, bool synthetic, bool fullEye,
                         int warpedEye, const std::wstring& name, unsigned& mask, int probeId = 0);
     void RequestStereoShots(int pairs);
+    struct OpticsSubmitTrace {
+        const char* source = "none";
+        float unzoomedEyeSpan = 0.0F;
+        float windowDivisor = 0.0F;
+        int lensPass = 0;
+        bool lensSubmitted = false;
+    };
     void TraceSubmittedFrame(int renderedEye, std::uint32_t matchedPose, std::uint32_t layerCount,
                              const XrCompositionLayerProjectionView views[2], XrResult result,
                              double submitMs, bool dlssSubmitted, bool staleWarpSubmitted,
                              const char* viewKind, const char* viewSpace, std::uint32_t drawPoseId,
-                             float submittedRoll);
+                             float submittedRoll, const OpticsSubmitTrace& optics);
     struct RenderPose;
     bool EnsureQuadSwapchain(const D3D11_TEXTURE2D_DESC& backBuffer);
     void DestroyQuadSwapchain();
@@ -86,7 +97,7 @@ private:
     bool BuildCursorLayer(const XrCompositionLayerQuad& screen, XrCompositionLayerQuad& cursor);
     HCURSOR ReadGameCursor(POINT& point, int& width, int& height);
     bool DrawCursorIntoScreen(ID3D11Texture2D* image);
-    bool BuildHudLayer(XrCompositionLayerQuad& hud);
+    bool BuildHudLayer(XrCompositionLayerQuad& hud, bool inventory);
     bool UploadCursor(HCURSOR handle);
     void PublishHeadPose();
     bool ReadGameFov(float& tanHalfHorizontal, float& tanHalfVertical);
@@ -104,6 +115,8 @@ private:
     std::uint32_t m_foreignPresents = 0;
 
     XrInstance m_instance = XR_NULL_HANDLE;
+    PFN_xrGetVisibilityMaskKHR m_getVisibilityMask = nullptr;
+    bool m_visibilityPending = true;
     bool m_steamVr = false;
     bool m_steamVrSceneSampleStarted = false;
     bool m_steamVrSceneSampleReprojected = false;
@@ -137,6 +150,7 @@ private:
     unsigned m_staleFallbacks = 0;
     XrCompositionLayerProjectionView m_stalePairViews[2]{};
     DlssWorld m_dlssWorld;
+    StereoCas m_stereoCas;
     bool m_dibrReported = false;
     int m_eyeCaptureId = 0;
     unsigned m_eyeCaptureMask = 0;
@@ -196,6 +210,8 @@ private:
     unsigned m_eyeRecommendedH = 0;
     unsigned m_frameMaxWidth = 8192;
     unsigned m_frameMaxHeight = 8192;
+    std::pair<unsigned, unsigned> m_startupSceneRequest{};
+    std::pair<unsigned, unsigned> m_reportedSceneExtent{};
     bool m_lensParity = false;  // alternates world/lens frames while a scope is up
     bool m_nativeValid[2]{false, false};  // AER native: each eye has a real native frame
     int m_vehicleForce = 0;  // 0 automatic, 1 on foot, 2 vehicle (Ctrl+Insert cycles)
@@ -209,6 +225,7 @@ private:
     void DrawMenuUi();
     void PlaceMenu();
     void SaveAllSettings();
+    bool m_vrsRadiusPreview = false;
     XrSwapchain m_menuSwapchain = XR_NULL_HANDLE;
     std::vector<XrSwapchainImageD3D11KHR> m_menuImages;
     XrPosef m_menuPose{{0.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, -1.3F}};
@@ -222,7 +239,7 @@ private:
     float m_weaponScale = 0.3F;
     float m_weaponConvergence = 0.7F;
     float m_weaponSize = 0.6F;
-    int m_poseLag = 1;  // screen height offset (Ctrl+PgUp/PgDn), as in the Tarkov mod
+    int m_poseLag = 1;  // Pose matching delay in frames.
     bool m_tuningInitialized = false;
 
     // World-fixed quad pose in LOCAL space (QuadAnchor=1).
@@ -247,6 +264,7 @@ private:
     double m_steamVrDesktopPresentSum = 0.0;
     double m_steamVrDesktopPresentMax = 0.0;
     bool m_frameTraceAttempted = false;
+    int m_opticsProbeCapture = 0;
     std::ofstream m_frameTrace;
     std::uint64_t m_notRendered = 0;
     std::uint64_t m_cursorFrames = 0;
@@ -348,6 +366,9 @@ private:
     bool m_headRecenterRequested = true;
     bool m_worldViewEnabled = true;
     int m_worldViewState = -1;
+    RenderPose m_lastConsumedPose{};
+    bool m_inventoryOpen = false;
+    bool m_inventoryPresented = false;
     std::uint64_t m_worldFrames = 0;
     std::uint32_t m_lastClientCalls = 0;
     std::uint32_t m_fovLogs = 0;

@@ -9,6 +9,7 @@
 | [MinHook](https://github.com/TsudaKageyu/minhook) | Native hooks | [BSD 2-Clause and bundled HDE notices](licenses/MinHook-LICENSE.txt) |
 | [Khronos OpenXR SDK Source](https://github.com/KhronosGroup/OpenXR-SDK-Source) | Statically linked OpenXR loader | [OpenXR notice](licenses/OpenXR-LICENSE.txt) and [Apache 2.0](licenses/OpenXR-Apache-2.0.txt) |
 | [JsonCpp](https://github.com/open-source-parsers/jsoncpp) | JSON parser bundled with the OpenXR loader | [Public domain / MIT](licenses/JsonCpp-LICENSE.txt) |
+| [AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS/tree/9fabcc9a2c45f958aff55ddfda337e74ef894b7f) | Optional stereo sharpening | [MIT](licenses/FidelityFX-CAS-LICENSE.txt) |
 
 ## Optional NVIDIA DLSS support
 

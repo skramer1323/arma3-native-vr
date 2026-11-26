@@ -6,9 +6,11 @@
 #include "FrameProbe.h"
 #include "HeadTracking.h"
 #include "Log.h"
+#include "OpticsZoom.h"
 #include "ProjectionCache.h"
 #include "QuadMath.h"
 #include "StereoShadowShader.h"
+#include "VrsPixelShader.h"
 #include "WorldShadingRate.h"
 #include "SinglePassDepth.h"
 
@@ -48,6 +50,7 @@ std::atomic<float> g_separationScale{1.0F};
 std::atomic<float> g_convergenceFactor{1.0F};
 std::atomic<float> g_projectionX{0.9F};
 std::atomic<bool> g_projMode{false};
+std::atomic<bool> g_centeredOptics{false};
 std::atomic<int> g_renderEye{-1};
 std::atomic<bool> g_captureDibrDepth{false};
 ComPtr<ID3D11Texture2D> g_dibrSceneDepth;
@@ -88,12 +91,16 @@ std::atomic<float> g_baseP00{0.0F};
 std::atomic<float> g_zoom{1.0F};
 std::atomic<bool> g_opticsIntent{false};
 std::atomic<float> g_drawZoom{1.0F};
+EngineZoomTrace g_zoomTrace;
 std::atomic<bool> g_scopeLens{false};  // magnifying optic in use and ScopeLens=1
 std::atomic<bool> g_scopeUi{false};    // magnifying optic up: the UI (reticle) is drawn in the picture at the aim axis
 std::atomic<int> g_lensPass{0};        // 0 none, 1 world frame, 2 lens frame (alternating)
 std::atomic<int> g_lensPassSet{0};     // pass chosen by the head pose publisher for the next frame
 std::atomic<bool> g_aerNative{false};  // AER with the engine's own projection and the full target per eye
 std::atomic<bool> g_monoScreen{false};  // menus/inventory: the engine draws one normal frame, no doubling
+std::atomic<bool> g_inventoryHud{false};
+bool g_inventoryDraw = false;
+bool g_lastInventoryDraw = false;
 std::atomic<bool> g_virtualBack{false};
 ComPtr<ID3D11Texture2D> g_virtTexture;
 ComPtr<ID3D11RenderTargetView> g_virtRtv;
@@ -140,6 +147,14 @@ ComPtr<ID3D11PixelShader> g_stereoShadowShader;
 bool g_stereoShadowShaderFailed = false;
 bool g_worldVrsThisFrame = false;
 bool g_worldVrsLastFrame = false;
+bool g_worldVrsCoarseThisFrame = false;
+bool g_worldVrsCoarseLastFrame = false;
+unsigned g_worldVrsAppliedDraws = 0;
+unsigned g_worldVrsFullRateDraws = 0;
+unsigned g_worldVrsTargetRejected = 0;
+unsigned g_worldVrsShaderRejected = 0;
+unsigned g_worldVrsBlendRejected = 0;
+unsigned g_worldVrsBindFailed = 0;
 bool g_stereoShadowThisFrame = false;
 bool g_stereoShadowLastFrame = false;
 // Partial projection records contain P00, P11, M20, M21, M30, M31, M32, M33.
@@ -215,6 +230,32 @@ std::unordered_set<ID3D11VertexShader*> g_depthOnlyVertexShaders;
 std::unordered_set<ID3D11PixelShader*> g_emptyDepthPixelShaders;
 std::unordered_set<ID3D11VertexShader*> g_prepassVertexShaders;
 std::unordered_set<ID3D11PixelShader*> g_prepassPixelShaders;
+std::unordered_set<ID3D11PixelShader*> g_opaqueVrsPixelShaders;
+
+bool CanShadeOpaqueMaterialCoarsely(ID3D11DeviceContext* context)
+{
+    ComPtr<ID3D11PixelShader> shader;
+    context->PSGetShader(&shader, nullptr, nullptr);
+    {
+        std::scoped_lock lock(g_shaderMutex);
+        if (!g_opaqueVrsPixelShaders.contains(shader.Get())) {
+            ++g_worldVrsShaderRejected;
+            return false;
+        }
+    }
+    ComPtr<ID3D11BlendState> blend;
+    float blendFactor[4]{};
+    UINT sampleMask = 0;
+    context->OMGetBlendState(&blend, blendFactor, &sampleMask);
+    if (!blend) return true;
+    D3D11_BLEND_DESC state{};
+    blend->GetDesc(&state);
+    if (state.AlphaToCoverageEnable || state.RenderTarget[0].BlendEnable) {
+        ++g_worldVrsBlendRejected;
+        return false;
+    }
+    return true;
+}
 
 bool IsVerifiedSinglePassDraw(ID3D11DeviceContext* context, ID3D11VertexShader* vertex,
                               ID3D11RenderTargetView* target)
@@ -347,6 +388,10 @@ void SampleWorldDrawPose(bool captureView)
     float matrices[32]{};
     const bool haveView = ReadRenderProjectionView(matrices);
     trace.returnedAfter = feed ? feed->LastReturnedId() : 0;
+    if (haveView) {
+        trace.nativeP00 = matrices[0];
+        trace.nativeP11 = matrices[5];
+    }
     if (haveView && std::all_of(matrices + 16, matrices + 32, [](float value) {
             return std::isfinite(value);
         }) && std::fabs(matrices[31] - 1.0F) < 0.01F) {
@@ -591,11 +636,22 @@ StereoDraw::StereoDraw(ID3D11DeviceContext* context, UINT elementCount, bool ins
         Begin(elementCount, instancedOrIndirect);
     }
     if (m_foveatedWorld) {
+        const auto& config = GetConfig();
         const WorldShadingProjection eyes[2]{
             {g_uploaded[0], g_uploaded[1], g_uploaded[2], g_uploaded[3]},
             {g_uploaded[8], g_uploaded[9], g_uploaded[10], g_uploaded[11]}};
-        g_worldVrsThisFrame |= SetWorldShadingRate(context, m_targetWidth,
-                                                  static_cast<UINT>(m_viewport.Height), eyes);
+        if (SetWorldShadingRate(context, m_targetWidth, static_cast<UINT>(m_viewport.Height), eyes,
+                                config.worldVrsInnerDegrees,
+                                WorldShadingTransitionEnd(config.worldVrsInnerDegrees),
+                                config.worldVrsCoarseOuter)) {
+            g_worldVrsThisFrame = true;
+            g_worldVrsCoarseThisFrame |= WorldShadingCoarseActive();
+            ++g_worldVrsAppliedDraws;
+        } else {
+            ++g_worldVrsBindFailed;
+        }
+    } else if (m_vrsWorldTarget) {
+        SuspendWorldShadingRate(context);
     } else {
         ClearWorldShadingRate(context);
     }
@@ -624,7 +680,7 @@ bool EnsureVirtualTarget(ID3D11DeviceContext* context, DXGI_FORMAT format)
     description.Format = format;
     description.SampleDesc.Count = 1;
     description.Usage = D3D11_USAGE_DEFAULT;
-    description.BindFlags = D3D11_BIND_RENDER_TARGET;
+    description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     ComPtr<ID3D11Texture2D> texture;
     ComPtr<ID3D11RenderTargetView> view;
     if (FAILED(device->CreateTexture2D(&description, nullptr, &texture)) ||
@@ -892,6 +948,7 @@ bool StereoDraw::BeginVirtual(ID3D11RenderTargetView* windowTarget)
             view.Texture2D.MostDetailedMip == 0 &&
             (view.Format == DXGI_FORMAT_R8G8B8A8_UNORM || view.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
              view.Format == DXGI_FORMAT_B8G8R8A8_UNORM || view.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+             view.Format == DXGI_FORMAT_R10G10B10A2_UNORM ||
              view.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || view.Format == DXGI_FORMAT_R11G11B10_FLOAT)) {
             ComPtr<ID3D11Resource> resource;
             ComPtr<ID3D11Texture2D> texture;
@@ -1083,10 +1140,13 @@ void StereoDraw::Begin(UINT elementCount, bool instanced)
         }
     }
 
-    // Through a scope the UI (reticle, black ring) is drawn in the picture, not on the HUD panel.
-    if (m_ui && g_hudQuadEnabled.load() && g_hudActive.load() && g_projMode.load() &&
-        !g_scopeUi.load() && BeginHudQuad()) {
-        if (GetConfig().stabilizeHudMarker && !instanced && (elementCount == 4 || elementCount == 6)) {
+    // Through a scope the reticle and mask are drawn in the picture.
+    const bool inventory = g_inventoryHud.load();
+    const bool captureHud = inventory ? g_virtualFrameReady : g_hudQuadEnabled.load() && g_hudActive.load();
+    if (m_ui && g_projMode.load() && !g_scopeUi.load() &&
+        captureHud && BeginHudQuad()) {
+        if (!inventory && GetConfig().stabilizeHudMarker && !instanced &&
+            (elementCount == 4 || elementCount == 6)) {
             CenterHudMarker(vertexShader.Get());
         }
         m_hudQuad = true;
@@ -1149,15 +1209,25 @@ void StereoDraw::Begin(UINT elementCount, bool instanced)
             }
             // Match the size of the last resolved independent VR scene. Half-size
             // auxiliary passes stay at full rate and cannot churn the primary mask.
-            if (rtv && !g_aerNative.load() && GetConfig().worldVrs && !g_scopeUi.load() &&
+            if (rtv && dsv && !g_aerNative.load() && GetConfig().worldVrs && !g_scopeUi.load() &&
                 !g_opticsIntent.load() && g_weaponAimingBlend.load() == 0.0F &&
                 g_drawZoom.load() <= 1.03F && g_frameWorldDepth.valid && g_virtualBack.load() &&
                 width == g_virtWidth && m_viewport.Height == static_cast<float>(g_virtHeight)) {
                 D3D11_RENDER_TARGET_VIEW_DESC color{};
                 rtv->GetDesc(&color);
-                m_foveatedWorld = color.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
-                    (color.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D ||
-                     color.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMS);
+                const bool worldColor = color.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                                        color.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
+                if (worldColor) {
+                    // Keep MSAA, blend and alpha-tested coverage at full rate.
+                    // The same tile mask is used only for eligible world materials.
+                    if (color.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D) {
+                        m_vrsWorldTarget = true;
+                        m_foveatedWorld = CanShadeOpaqueMaterialCoarsely(m_context);
+                    } else {
+                        ++g_worldVrsTargetRejected;
+                    }
+                    if (!m_foveatedWorld) ++g_worldVrsFullRateDraws;
+                }
             }
             if (g_virtualBack.load() && width > g_frameSceneWidth) {
                 g_frameSceneWidth = width;
@@ -1359,7 +1429,7 @@ void StereoDraw::SetEye(int eye)
             forwardY = -(tanUp - tanDown) / std::max(0.2F, tanUp + tanDown);
             half = g_halfIpd.load();
             inverseConvergence = 0.0F;  // the headset frustum converges at infinity
-            if (lens) {
+            if (lens && !g_centeredOptics.load()) {
                 // Through a scope the reticle belongs to the weapon: it sits where the bore points in
                 // the picture (the picture is magnified by the game zoom, so is the offset of the aim
                 // axis from the view centre) and follows the mouse, not the head.
@@ -1370,13 +1440,7 @@ void StereoDraw::SetEye(int eye)
                 forwardY += std::clamp(g_weaponForward[1].load() / aimZ * p11Scope * magnification, -3.0F, 3.0F);
             }
             if (!lens && GetConfig().hudBodyLock && g_hudLock.load()) {
-                // The HUD stays where the body aims (like the weapon) while the head looks
-                // around: put its centre where the aim direction lies in this eye image.
-                // As in the Tarkov mod (HudLayer): a panel fixed in the room in front of the
-                // recentre direction (it follows the weapon pitch, the mouse does not turn it).
-                // Head movement gives parallax: the centre of the panel in camera space is
-                // distance * aim direction - head offset, and the panel grows when the head
-                // comes closer.
+                // Project the body-aligned HUD panel after applying the viewer's head offset.
                 const float hudDistance = std::max(0.3F, g_hudDistance.load());
                 const float px = hudDistance * g_weaponForward[0].load() - g_lean[0].load();
                 const float py = hudDistance * g_weaponForward[1].load() - g_lean[1].load();
@@ -1633,9 +1697,17 @@ void EngineStereoNoteVertexShader(ID3D11VertexShader* shader, const void* code, 
     g_blitShaders.insert(shader);
 }
 
-void EngineStereoNotePixelShader(ID3D11PixelShader* shader, std::uint64_t bytecodeHash)
+void EngineStereoNotePixelShader(ID3D11PixelShader* shader, const void* code, SIZE_T size,
+                                std::uint64_t bytecodeHash)
 {
+    ComPtr<ID3DBlob> listing;
+    const bool opaque = size >= 1024 &&
+        SUCCEEDED(D3DDisassemble(code, size, D3D_DISASM_DISABLE_DEBUG_INFO, nullptr, &listing)) &&
+        listing && IsOpaqueVrsMaterial({static_cast<const char*>(listing->GetBufferPointer()),
+                                        listing->GetBufferSize()});
     std::scoped_lock lock(g_shaderMutex);
+    g_opaqueVrsPixelShaders.erase(shader);
+    if (opaque) g_opaqueVrsPixelShaders.insert(shader);
     // These shaders consume the verified interpolants and only write SV_Target0.
     if (GetConfig().singlePassWorldPrepass && (bytecodeHash == 0x70d42f7413931f06ULL ||
         bytecodeHash == 0x9415ff056842a49bULL || bytecodeHash == 0x93b19fefd1f317c0ULL ||
@@ -1670,9 +1742,10 @@ void EngineStereoSetTuning(bool enabled, bool flat, float separationScale, float
 }
 
 void EngineStereoSetHeadset(bool active, float halfIpdMeters, const float tangents[8],
-                            float aimBias)
+                            float aimBias, bool centeredOptics)
 {
     g_aimBias.store(std::clamp(aimBias, -1.0F, 1.0F));
+    g_centeredOptics.store(centeredOptics);
     for (int i = 0; i < 8; ++i) {
         g_eyeTan[i].store(std::clamp(tangents[i], 0.1F, 6.0F));
     }
@@ -1770,9 +1843,34 @@ bool EngineStereoScopeLens()
     return g_scopeLens.load() && g_projMode.load();
 }
 
+EngineZoomTrace EngineStereoLastZoomTrace()
+{
+    return g_zoomTrace;
+}
+
 void EngineStereoSetMonoScreen(bool mono)
 {
     g_monoScreen.store(mono);
+}
+
+void EngineStereoSetInventoryHud(bool active)
+{
+    g_inventoryHud.store(active);
+}
+
+std::uint64_t EngineStereoFrameId()
+{
+    return g_frame.load(std::memory_order_relaxed);
+}
+
+void EngineStereoNoteInventoryDraw()
+{
+    g_inventoryDraw = true;
+}
+
+bool EngineStereoLastInventoryDraw()
+{
+    return g_lastInventoryDraw;
 }
 
 void EngineStereoSetVirtualBack(bool enabled)
@@ -1821,9 +1919,7 @@ float EngineStereoZoom()
 
 void EngineStereoResetZoomReference()
 {
-    // Kept on purpose: the reference is the widest game field of view ever seen. Resetting it on
-    // recentre took a zoomed value as "not zoomed" (log 2026-11-17 20:12: false zoom 1.32, a
-    // false aiming lock and a jumping picture).
+    // Preserve the widest known game FOV so recentering while scoped cannot reset the zoom baseline.
 }
 
 void EngineStereoSetWeapon(float separationScale, float convergenceMeters, float sizeScale)
@@ -1899,6 +1995,11 @@ bool EngineStereoLastWorldVrs()
     return g_worldVrsLastFrame;
 }
 
+bool EngineStereoLastWorldVrsCoarse()
+{
+    return g_worldVrsCoarseLastFrame;
+}
+
 bool EngineStereoLastStereoShadow()
 {
     return g_stereoShadowLastFrame;
@@ -1949,10 +2050,14 @@ void EngineStereoOnPresent(IDXGISwapChain* swapChain)
     g_frameSceneWidth = g_frameSceneHeight = 0;
     // The next draw starts on a clear HUD even if OpenXR skipped the completed frame.
     g_hudLastReady = g_hudQuadDraws.exchange(0) > 0;
+    g_lastInventoryDraw = g_inventoryDraw;
+    g_inventoryDraw = false;
     g_lastWorldDepth = g_frameWorldDepth;
     g_lastWorldDrawPose = g_frameWorldDrawPose;
     ClearWorldShadingRate();
     g_worldVrsLastFrame = g_worldVrsThisFrame;
+    g_worldVrsCoarseLastFrame = g_worldVrsCoarseThisFrame;
+    g_worldVrsCoarseThisFrame = false;
     g_stereoShadowLastFrame = g_stereoShadowThisFrame;
     g_worldVrsThisFrame = g_stereoShadowThisFrame = false;
     g_frameWorldDepth = {};
@@ -1986,20 +2091,39 @@ void EngineStereoOnPresent(IDXGISwapChain* swapChain)
         return;
     }
     float matrices[32]{};
-    if (ReadRenderProjectionView(matrices)) {
-        if (matrices[0] > 0.2F && matrices[0] < 8.0F) {
-            g_projectionX.store(matrices[0]);
+    const bool traceZoom = GetConfig().detailedCapture;
+    const bool haveProjection = ReadRenderProjectionView(matrices);
+    if (traceZoom) {
+        g_zoomTrace = {};
+        g_zoomTrace.nativeP00 = matrices[0];
+        g_zoomTrace.nativeP11 = matrices[5];
+        g_zoomTrace.reference = g_baseP00.load();
+        g_zoomTrace.previousReference = g_zoomTrace.reference;
+        if (haveProjection && g_zoomTrace.reference > 0.0F) {
+            g_zoomTrace.nativeRatio = matrices[0] / g_zoomTrace.reference;
+        }
+        g_zoomTrace.opticsIntent = g_opticsIntent.load();
+        g_zoomTrace.decision = haveProjection ? "p00_outside_limits" : "no_native_projection";
+    }
+    static bool confirmedOptics = false;
+    if (haveProjection) {
+        if (ValidZoomProjection(matrices[0], matrices[5], matrices[11])) {
+            if (matrices[0] < 8.0F) {
+                g_projectionX.store(matrices[0]);
+            }
             if (g_projMode.load() && g_hudActive.load()) {
                 float base = g_baseP00.load();
                 const bool explicitOptics = GetConfig().adsRightMouseToggle;
                 const bool optics = g_opticsIntent.load();
                 static float candidate = 0.0F;
                 static int stableFrames = 0;
-                bool updateBase = base <= 0.0F;
+                bool updateBase = base <= 0.0F && matrices[0] < 1.25F;
                 if (explicitOptics) {
                     // Seat and camera switches change the native lens even at normal
                     // VR scale. Track a settled non-optics lens for the next sight.
-                    if (!optics) {
+                    const bool trackReference = NativeZoomMayUpdateReference(matrices[0], base, optics);
+                    updateBase &= trackReference;
+                    if (trackReference) {
                         if (std::fabs(matrices[0] - candidate) > 0.0005F) {
                             candidate = matrices[0];
                             stableFrames = 0;
@@ -2020,11 +2144,17 @@ void EngineStereoOnPresent(IDXGISwapChain* swapChain)
                         Log("STEREO zoom reference P00=%.4f", base);
                     }
                 }
-                float zoom = std::clamp(matrices[0] / base, 1.0F, 20.0F);
-                // Small FOV changes across seat cameras are not meaningful optics
-                // magnification. E.g. the captured cabin change was 1.20x.
-                if (explicitOptics && (!optics || zoom < 1.25F)) {
-                    zoom = 1.0F;
+                confirmedOptics = explicitOptics &&
+                    KeepNativeOptics(matrices[0], base, optics, confirmedOptics);
+                const float zoom = NativeOpticsZoom(matrices[0], base, explicitOptics,
+                                                    optics || confirmedOptics);
+                if (traceZoom) {
+                    g_zoomTrace.reference = base;
+                    g_zoomTrace.nativeRatio = base > 0.0F ? matrices[0] / base : 0.0F;
+                    g_zoomTrace.opticsIntent = optics;
+                    g_zoomTrace.referenceUpdated = updateBase;
+                    g_zoomTrace.decision = base <= 0.0F ? "waiting_for_world_reference" :
+                        explicitOptics && zoom == 1.0F ? "below_zoom_threshold" : "accepted";
                 }
                 g_zoom.store(zoom);
                 static float loggedZoom = 1.0F;
@@ -2035,7 +2165,9 @@ void EngineStereoOnPresent(IDXGISwapChain* swapChain)
                         matrices[0], base);
                 }
             } else {
+                confirmedOptics = false;
                 g_zoom.store(1.0F);
+                if (traceZoom) g_zoomTrace.decision = "world_projection_inactive";
             }
         }
     }
@@ -2057,6 +2189,20 @@ void EngineStereoOnPresent(IDXGISwapChain* swapChain)
     }
     const int every = GetConfig().statsEveryPresents;
     if (every > 0 && g_presents % static_cast<std::uint64_t>(every) == 0) {
+        if (GetConfig().worldVrs || g_worldVrsAppliedDraws || g_worldVrsFullRateDraws) {
+            Log("World VRS over %d presents: %u eligible material draws shaded by rings, "
+                "%u color draws protected at full rate",
+                every, g_worldVrsAppliedDraws, g_worldVrsFullRateDraws);
+            if (g_worldVrsFullRateDraws || g_worldVrsBindFailed) {
+                Log("World VRS rejection: multisampled or other target %u, shader %u, "
+                    "blend or alpha-to-coverage %u, rate binding failed %u",
+                    g_worldVrsTargetRejected, g_worldVrsShaderRejected,
+                    g_worldVrsBlendRejected, g_worldVrsBindFailed);
+            }
+            g_worldVrsAppliedDraws = g_worldVrsFullRateDraws = 0;
+            g_worldVrsTargetRejected = g_worldVrsShaderRejected = 0;
+            g_worldVrsBlendRejected = g_worldVrsBindFailed = 0;
+        }
         if (!g_desktopHudMirror.load()) {
             Log("SteamVR desktop HUD: %llu duplicate draws skipped over %d presents",
                 static_cast<unsigned long long>(g_skippedDesktopHudDraws), every);

@@ -1,6 +1,6 @@
 # Building Arma 3 Native VR
 
-Use Windows x64, Visual Studio 2022 Build Tools with **Desktop development with C++** and a Windows SDK, CMake 3.24 or later, Git and Python 3. The OpenXR loader uses Python during the build. On first configure, CMake fetches pinned versions of OpenXR SDK Source and MinHook. Dear ImGui is included in the repository.
+Use Windows x64, Visual Studio 2022 Build Tools with **Desktop development with C++** and a Windows SDK, CMake 3.24 or later, Git and Python 3. The OpenXR loader uses Python during the build. The Windows SDK's `fxc.exe` compiles the CAS compute shader. On first configure, CMake fetches pinned versions of OpenXR SDK Source and MinHook. Dear ImGui is included in the repository.
 
 Open **Developer PowerShell for VS 2022** with the x64 tools selected. Run these commands from the project directory.
 

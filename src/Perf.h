@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <wrl/client.h>
 
 #include <atomic>
 
@@ -49,25 +50,28 @@ public:
 private:
     static constexpr int kRing = 8;
     struct Slot {
-        ID3D11Query* disjoint = nullptr;
-        ID3D11Query* start = nullptr;
-        ID3D11Query* end = nullptr;
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
+        Microsoft::WRL::ComPtr<ID3D11Query> start;
+        Microsoft::WRL::ComPtr<ID3D11Query> end;
         bool pending = false;
     };
     Slot m_slots[kRing]{};
     int m_current = -1;
     int m_next = 0;
-    ID3D11Device* m_device = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
 };
 
 PerfGpuTimer& PerfDlssGpuTimer();
 PerfGpuTimer& PerfStaleEyeGpuTimer();
 PerfGpuTimer& PerfDibrGpuTimer();
 PerfGpuTimer& PerfXrCopyGpuTimer();
+PerfGpuTimer& PerfCasGpuTimer();
 
-// Whole-frame GPU timeline: mark 0 after the previous Present, 1 when our Present hook starts (all
-// engine work queued), 2 when our Present-side work (DLSS, copies) is queued.
-void PerfFrameGpuMark(IDXGISwapChain* swapChain, int mark, std::uint64_t nextPresent = 0);
+// Mark the queue interval after the previous desktop Present, before the current
+// Present hook and at the end of its submission work. The interval may include GPU idle time.
+void PerfFrameGpuBegin(IDXGISwapChain* swapChain, ID3D11Device* device,
+                       ID3D11DeviceContext* context, std::uint64_t nextPresent);
+void PerfFrameGpuMark(IDXGISwapChain* swapChain, int mark);
 
 // Called once per Present after everything (log line every `every` presents).
 void PerfOnPresentDone(ID3D11DeviceContext* context, std::uint64_t presents, int every);

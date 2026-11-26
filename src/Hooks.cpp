@@ -63,23 +63,56 @@ bool HookFunction(void* target, void* replacement, void** original, const char* 
 
 namespace {
 std::uint64_t g_perfPresents = 0;
-// Counts real presents and writes the PERF lines (every 120).
+// Counts real presents on the OpenXR swapchain and writes PERF lines every 120.
 void PerfAfterPresent(IDXGISwapChain* swapChain)
 {
-    if (!PerfEnabled()) {
-        return;
-    }
     ID3D11Device* device = nullptr;
     if (SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device))) && device) {
         ID3D11DeviceContext* context = nullptr;
         device->GetImmediateContext(&context);
         if (context) {
             PerfOnPresentDone(context, ++g_perfPresents, 120);
+            PerfFrameGpuBegin(swapChain, device, context, g_perfPresents + 1);
             context->Release();
         }
         device->Release();
-        PerfFrameGpuMark(swapChain, 0, g_perfPresents + 1);
     }
+}
+
+template <typename Present>
+HRESULT PresentFrame(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags, Present&& present)
+{
+    if ((flags & DXGI_PRESENT_TEST) != 0 || t_presentDepth != 0) {
+        PresentScope scope;
+        return present(syncInterval);
+    }
+
+    auto& runtime = OpenXRRuntime::Instance();
+    const bool profile = PerfEnabled() && runtime.IsMainSwapChain(swapChain);
+    const double started = profile ? PerfNowMs() : 0.0;
+    if (profile) PerfFrameGpuMark(swapChain, 1);
+    FrameProbeOnPresent(swapChain);
+    EngineStereoOnPresent(swapChain);
+    const bool prepareAfterPresent = runtime.OnPresent(swapChain);
+    if (profile) {
+        PerfFrameGpuMark(swapChain, 2);
+        PerfAddPresentSide(PerfNowMs() - started, 0.0, 0.0);
+    }
+
+    PresentScope scope;
+    // The runtime already paces the world frame when the next XR wait is deferred.
+    const UINT desktopSync = prepareAfterPresent ? 0 : syncInterval;
+    const bool timeDesktop = profile || prepareAfterPresent;
+    const double desktopStart = timeDesktop ? PerfNowMs() : 0.0;
+    const HRESULT result = present(desktopSync);
+    const double desktopEnd = timeDesktop ? PerfNowMs() : 0.0;
+    if (profile) PerfAddOriginalPresent(desktopEnd - desktopStart);
+    if (prepareAfterPresent) {
+        runtime.OnAfterPresent(swapChain, desktopEnd - desktopStart, desktopSync);
+        if (profile) PerfAddPresentSide(PerfNowMs() - desktopEnd, 0.0, 0.0);
+    }
+    if (profile) PerfAfterPresent(swapChain);
+    return result;
 }
 }  // namespace
 
@@ -89,31 +122,8 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterv
         Log("RUNG1 first IDXGISwapChain::Present: swapchain=%p sync=%u flags=0x%X thread=%lu",
             swapChain, syncInterval, flags, GetCurrentThreadId());
     }
-    const double perfT0 = PerfNowMs();
-    bool prepareAfterPresent = false;
-    if ((flags & DXGI_PRESENT_TEST) == 0 && t_presentDepth == 0) {
-        PerfFrameGpuMark(swapChain, 1);
-        FrameProbeOnPresent(swapChain);
-        EngineStereoOnPresent(swapChain);
-        prepareAfterPresent = OpenXRRuntime::Instance().OnPresent(swapChain);
-        PerfFrameGpuMark(swapChain, 2);
-    }
-    PerfAddPresentSide(PerfNowMs() - perfT0, 0.0, 0.0);
-    PresentScope scope;
-    // SteamVR already paces the world frame via xrWaitFrame.
-    const UINT desktopSync = prepareAfterPresent ? 0 : syncInterval;
-    const double perfOrig = PerfNowMs();
-    const HRESULT perfResult = g_originalPresent(swapChain, desktopSync, flags);
-    const double afterPresent = PerfNowMs();
-    PerfAddOriginalPresent(afterPresent - perfOrig);
-    if (prepareAfterPresent) {
-        OpenXRRuntime::Instance().OnAfterPresent(swapChain, afterPresent - perfOrig, desktopSync);
-        PerfAddPresentSide(PerfNowMs() - afterPresent, 0.0, 0.0);
-    }
-    if ((flags & DXGI_PRESENT_TEST) == 0 && t_presentDepth == 1) {
-        PerfAfterPresent(swapChain);
-    }
-    return perfResult;
+    return PresentFrame(swapChain, syncInterval, flags,
+                        [&](UINT interval) { return g_originalPresent(swapChain, interval, flags); });
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swapChain, UINT syncInterval,
@@ -123,30 +133,9 @@ HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swapChain, UINT syncInte
         Log("RUNG1 first IDXGISwapChain1::Present1: swapchain=%p thread=%lu", swapChain,
             GetCurrentThreadId());
     }
-    const double perfT0 = PerfNowMs();
-    bool prepareAfterPresent = false;
-    if ((flags & DXGI_PRESENT_TEST) == 0 && t_presentDepth == 0) {
-        PerfFrameGpuMark(swapChain, 1);
-        FrameProbeOnPresent(swapChain);
-        EngineStereoOnPresent(swapChain);
-        prepareAfterPresent = OpenXRRuntime::Instance().OnPresent(swapChain);
-        PerfFrameGpuMark(swapChain, 2);
-    }
-    PerfAddPresentSide(PerfNowMs() - perfT0, 0.0, 0.0);
-    PresentScope scope;
-    const UINT desktopSync = prepareAfterPresent ? 0 : syncInterval;
-    const double perfOrig = PerfNowMs();
-    const HRESULT perfResult = g_originalPresent1(swapChain, desktopSync, flags, parameters);
-    const double afterPresent = PerfNowMs();
-    PerfAddOriginalPresent(afterPresent - perfOrig);
-    if (prepareAfterPresent) {
-        OpenXRRuntime::Instance().OnAfterPresent(swapChain, afterPresent - perfOrig, desktopSync);
-        PerfAddPresentSide(PerfNowMs() - afterPresent, 0.0, 0.0);
-    }
-    if ((flags & DXGI_PRESENT_TEST) == 0 && t_presentDepth == 1) {
-        PerfAfterPresent(swapChain);
-    }
-    return perfResult;
+    return PresentFrame(swapChain, syncInterval, flags, [&](UINT interval) {
+        return g_originalPresent1(swapChain, interval, flags, parameters);
+    });
 }
 
 HRESULT STDMETHODCALLTYPE HookResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount,
@@ -161,9 +150,7 @@ HRESULT STDMETHODCALLTYPE HookResizeBuffers(IDXGISwapChain* swapChain, UINT buff
     return result;
 }
 
-// Reads the DXGI swapchain vtable from a throw-away device on a hidden window.
-// All swapchains from dxgi.dll share these functions, so hooking the code
-// (not the vtable slot) catches the game's swapchain too (same method as A3VR).
+// A temporary swapchain provides the shared DXGI entry points used by the game.
 bool InstallSwapChainHooks()
 {
     WNDCLASSEXW windowClass{sizeof(windowClass)};

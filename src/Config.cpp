@@ -2,6 +2,7 @@
 
 #include "Log.h"
 #include "QuadMath.h"
+#include "WorldShadingMask.h"
 
 #include <Windows.h>
 
@@ -113,6 +114,7 @@ void LoadConfig()
     g_config.virtualCursor = ReadInt(L"VirtualCursor", 1) != 0;
     g_config.virtualCursorSpeed = std::clamp(ReadFloat(L"VirtualCursorSpeed", 1.0F), 0.2F, 5.0F);
     g_config.monoScreen = ReadInt(L"MonoScreen", 1) != 0;
+    g_config.inventoryInVr = ReadInt(L"InventoryInVR", 1) != 0;
     g_config.virtualBackBuffer = ReadInt(L"VirtualBackBuffer", 0) != 0;
     g_config.dibrFillMode = std::clamp(ReadInt(L"DibrFillMode", 1), 0, 2);
     g_config.adsLockView = ReadInt(L"AdsLockView", 1) != 0;
@@ -122,6 +124,7 @@ void LoadConfig()
     g_config.cullHashes = ReadHashList(L"CullHashes");
     g_config.scopeLens = ReadInt(L"ScopeLens", 0) != 0;
     g_config.scopeReticle = ReadInt(L"ScopeReticle", 1) != 0;
+    g_config.hideNightVisionMask = ReadInt(L"HideNightVisionMask", 1) != 0;
     g_config.scopeStatic = ReadInt(L"ScopeStatic", 1) != 0;
     g_config.scopeWeaponFlat = ReadInt(L"ScopeWeaponFlat", 1) != 0;
     g_config.scopeLensDegrees = std::clamp(ReadFloat(L"ScopeLensDegrees", 30.0F), 8.0F, 70.0F);
@@ -136,6 +139,11 @@ void LoadConfig()
     g_config.aerDibrPreference = 0;
     g_config.stereoShadows = ReadInt(L"StereoShadows", 1) != 0;
     g_config.worldVrs = ReadInt(L"WorldVrs", 0) != 0;
+    g_config.worldVrsInnerDegrees = std::clamp(ReadInt(L"WorldVrsInnerDegrees", 35),
+                                               kWorldShadingMinRadius, kWorldShadingMaxRadius);
+    g_config.worldVrsShowRings = ReadInt(L"WorldVrsShowRings", 0) != 0;
+    g_config.worldVrsCoarseOuter = ReadInt(L"WorldVrsCoarseOuter", 0) != 0;
+    g_config.casSharpnessPercent = std::clamp(ReadInt(L"CasSharpnessPercent", 0), 0, 100);
     g_config.singlePassDepth = ReadInt(L"SinglePassDepth", 0) != 0;
     g_config.singlePassWorldPrepass = ReadInt(L"SinglePassWorldPrepass", 0) != 0;
     g_config.weaponBodyLock = ReadInt(L"WeaponBodyLock", 1) != 0;

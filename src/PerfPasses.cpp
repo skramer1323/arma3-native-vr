@@ -195,6 +195,14 @@ void PerfGpuPassFinish()
     g_repeatContext.store(nullptr);
 }
 
+void PerfGpuPassDiscard()
+{
+    std::scoped_lock lock(g_sampleMutex);
+    g_passContext.store(nullptr);
+    g_repeatContext.store(nullptr);
+    g_sample.present = 0;
+}
+
 bool PerfGpuPassCollect(ID3D11DeviceContext* context, UINT64 start, UINT64 end, UINT64 post,
                         const D3D11_QUERY_DATA_TIMESTAMP_DISJOINT& clock)
 {

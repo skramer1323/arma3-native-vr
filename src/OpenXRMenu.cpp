@@ -1,4 +1,4 @@
-﻿// Settings menu (Insert): the widgets and the panel that shows them in the headset.
+// Settings menu (Insert): the widgets and the panel that shows them in the headset.
 // Members of OpenXRRuntime, kept in their own file so OpenXRRuntime.cpp does not grow further.
 
 #include "OpenXRRuntime.h"
@@ -28,6 +28,7 @@ constexpr std::uint32_t kMenuWidth = 1280;
 constexpr std::uint32_t kMenuHeight = 960;
 constexpr float kMenuDistanceMeters = 1.3F;
 constexpr float kMenuWidthMeters = 1.6F;
+bool g_menuScreenshotRequested = false;
 
 }  // namespace
 
@@ -159,13 +160,8 @@ bool OpenXRRuntime::RenderMenuLayer(XrCompositionLayerQuad& layer)
             drawn = Menu::Instance().Render(m_device.Get(), m_context.Get(), target, kMenuWidth,
                                             kMenuHeight, static_cast<float>(MenuPixelScale()),
                                             [this]() { DrawMenuUi(); });
-            // Self-check: the panel as drawn, saved once per opening (no headset needed to look at it).
-            static int menuFrames = 0;
-            if (menuFrames == 0 && Menu::Instance().IsOpen()) {
-                Log("MENU first frame rendered (drawn=%d)", drawn ? 1 : 0);
-            }
-            menuFrames = Menu::Instance().IsOpen() ? menuFrames + 1 : 0;
-            if (drawn && menuFrames == 30) {
+            if (drawn && g_menuScreenshotRequested) {
+                g_menuScreenshotRequested = false;
                 const std::wstring path = (ModuleDirectory() / L"arma3_native_vr.menu.jpg").wstring();
                 D3D11_TEXTURE2D_DESC menuDesc{};
                 m_menuImages[index].texture->GetDesc(&menuDesc);
@@ -209,6 +205,11 @@ void OpenXRRuntime::SaveAllSettings()
     SaveIniValue(L"StabilizeHudMarker", config.stabilizeHudMarker ? 1 : 0);
     SaveIniValue(L"HideGameplayHud", config.hideGameplayHud ? 1 : 0);
     SaveIniValue(L"StabilizeArmaRoll", config.stabilizeArmaRoll ? 1 : 0);
+    SaveIniValue(L"WorldVrs", config.worldVrs ? 1 : 0);
+    SaveIniValue(L"WorldVrsInnerDegrees", config.worldVrsInnerDegrees);
+    SaveIniValue(L"WorldVrsCoarseOuter", config.worldVrsCoarseOuter ? 1 : 0);
+    SaveIniValue(L"WorldVrsShowRings", config.worldVrsShowRings ? 1 : 0);
+    SaveIniValue(L"CasSharpnessPercent", config.casSharpnessPercent);
     SaveIniValue(L"DlssBalancedExperimental", config.dlssBalancedExperimental ? 1 : 0);
     SaveIniValue(L"ScopeLens", config.scopeLens ? 1 : 0);
     SaveIniValue(L"ScopeLensDegrees", config.scopeLensDegrees);
@@ -231,6 +232,8 @@ void OpenXRRuntime::SaveAllSettings()
 
 void OpenXRRuntime::DrawMenuUi()
 {
+    const bool wasPreviewingRadius = m_vrsRadiusPreview;
+    m_vrsRadiusPreview = false;
     if (!Menu::Instance().IsOpen()) {
         // Shader browser only (menu closed): a small readout, the rest of the panel stays clear.
         ImGui::SetNextWindowPos(ImVec2(20.0F, 20.0F));
@@ -253,6 +256,9 @@ void OpenXRRuntime::DrawMenuUi()
     }
     ImGui::SetNextWindowPos(ImVec2(0.0F, 0.0F));
     ImGui::SetNextWindowSize(ImVec2(static_cast<float>(kMenuWidth), static_cast<float>(kMenuHeight)));
+    if (wasPreviewingRadius && EngineStereoLastWorldVrs()) {
+        ImGui::SetNextWindowBgAlpha(0.38F);
+    }
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                                    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
                                    ImGuiWindowFlags_NoTitleBar;
@@ -261,10 +267,14 @@ void OpenXRRuntime::DrawMenuUi()
         return;
     }
     Config& config = MutableConfig();
-    ImGui::TextUnformatted("Arma 3 VR Settings");
-    ImGui::SameLine(0.0F, 30.0F);
-    ImGui::TextDisabled("Insert or Esc closes settings.");
-    if (ImGui::Button("Recenter view (F11)")) {
+    const float rightEdge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Arma 3 VR settings");
+    const char* recenterLabel = "Recenter view (F11)";
+    const auto& style = ImGui::GetStyle();
+    const float recenterWidth = ImGui::CalcTextSize(recenterLabel).x + 2.0F * style.FramePadding.x;
+    ImGui::SameLine(rightEdge - recenterWidth);
+    if (ImGui::Button(recenterLabel)) {
         m_headRecenterRequested = true;
         m_recenterRequested = true;
         EngineStereoResetZoomReference();
@@ -272,20 +282,132 @@ void OpenXRRuntime::DrawMenuUi()
     }
     ImGui::Separator();
 
-    ImGui::BeginChild("settings-content", ImVec2(0.0F, -90.0F));
+    const float footerHeight = ImGui::GetFrameHeightWithSpacing() + 2.0F * style.ItemSpacing.y;
+    ImGui::BeginChild("settings-content", ImVec2(0.0F, -footerHeight));
+    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.54F);
     if (ImGui::BeginTabBar("tabs")) {
-        if (ImGui::BeginTabItem("Head tracking")) {
-            const char* mode = m_vehicleMode ? "In vehicle" : "On foot";
-            ImGui::Text("Current mode: %s", mode);
-            if (ImGui::Button("On foot")) {
-                m_vehicleForce = 1;
+        if (ImGui::BeginTabItem("Rendering")) {
+            ImGui::SeparatorText("Peripheral rendering");
+            if (ImGui::Checkbox("Enable peripheral shading", &config.worldVrs)) {
+                Log("World VRS requested %s at %d deg",
+                    config.worldVrs ? "on" : "off", config.worldVrsInnerDegrees);
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Vehicle")) {
-                m_vehicleForce = 2;
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("This build requires NVIDIA VRS, full stereo and MSAA off. Aiming uses full shading.");
             }
-            ImGui::SameLine();
-            ImGui::SliderInt("Head pose delay (frames)", &m_poseLag, 1, 4);
+            if (config.worldVrs) {
+                ImGui::SameLine(0.0F, 24.0F);
+                if (EngineStereoLastWorldVrs()) {
+                    ImGui::TextColored(ImVec4(0.45F, 0.90F, 0.72F, 1.0F), "Active");
+                } else {
+                    ImGui::TextDisabled("Waiting for eligible gameplay");
+                }
+            }
+            ImGui::BeginDisabled(!config.worldVrs);
+            ImGui::SliderInt("Sharp center radius", &config.worldVrsInnerDegrees,
+                             kWorldShadingMinRadius, kWorldShadingMaxRadius, "%d deg",
+                             ImGuiSliderFlags_AlwaysClamp);
+            m_vrsRadiusPreview = config.worldVrs && ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                Log("World VRS sharp center radius set to %d deg", config.worldVrsInnerDegrees);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Drag to resize the sharp center. A smaller circle reduces GPU work on more of the scene.");
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SeparatorText("Image clarity");
+            ImGui::SliderInt("FidelityFX CAS sharpness", &config.casSharpnessPercent, 0, 100, "%d%%",
+                             ImGuiSliderFlags_AlwaysClamp);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("At 0%% sharpening is off. When VRS is active, sharpening fades towards the periphery.");
+            }
+
+            if (ImGui::CollapsingHeader("Render resolution")) {
+                unsigned sceneWidth = 0, sceneHeight = 0;
+                EngineStereoSceneSize(sceneWidth, sceneHeight);
+                if (sceneWidth && sceneHeight) {
+                    ImGui::Text("Current Arma scene  %u x %u", sceneWidth, sceneHeight);
+                }
+                if (m_startupSceneRequest.first) {
+                    ImGui::Text("Startup request  %u x %u", m_startupSceneRequest.first,
+                                m_startupSceneRequest.second);
+                    if (m_reportedSceneExtent.first && m_reportedSceneExtent != m_startupSceneRequest) {
+                        ImGui::TextColored(ImVec4(1.0F, 0.76F, 0.4F, 1.0F),
+                                           "Arma allocated a different scene size in this mission.");
+                        ImGui::TextDisabled("Use Sampling in Arma's video settings to change the actual scene size.");
+                    }
+                } else if (GetConfig().virtualBackBuffer) {
+                    ImGui::TextDisabled("Arma's Sampling controls the scene size.");
+                }
+                bool automatic = GetConfig().autoHeadsetResolution;
+                const bool resizeWindow = !GetConfig().virtualBackBuffer;
+                static int percent = 0;
+                static const char* resolutionStatus = nullptr;
+                const unsigned recommendedW = m_eyeRecommendedW > 0 ? m_eyeRecommendedW : 2636U;
+                const unsigned recommendedH = m_eyeRecommendedH > 0 ? m_eyeRecommendedH : 2804U;
+                const auto [autoWidth, autoHeight] = StereoFrameSize(recommendedW, recommendedH, 100,
+                    m_frameMaxWidth, m_frameMaxHeight);
+                if (ImGui::Checkbox("Automatic 16:9 stereo frame size", &automatic)) {
+                    resolutionStatus = "The size mode will apply on restart.";
+                    config.autoHeadsetResolution = automatic;
+                    SaveIniValue(L"AutoHeadsetResolution", automatic ? 1 : 0);
+                    if (automatic && !resizeWindow) {
+                        const bool scheduled = ScheduleCfgResolution(static_cast<int>(autoWidth),
+                                                                     static_cast<int>(autoHeight), false);
+                        resolutionStatus = scheduled ? "Restart Arma and check the actual scene size in a mission."
+                                                     : "Could not schedule the new frame size.";
+                    }
+                }
+                const int maxPercent = std::max(100, static_cast<int>(std::min(
+                    m_frameMaxWidth * 100 / std::max(1U, autoWidth),
+                    m_frameMaxHeight * 100 / std::max(1U, autoHeight))));
+                if (percent == 0) {
+                    const int wantedW = GetConfig().forceGameWidth;
+                    percent = !automatic && wantedW > 0 && autoWidth > 0
+                        ? static_cast<int>(std::lround(100.0F * wantedW / autoWidth)) : 100;
+                }
+                percent = std::clamp(percent, 30, maxPercent);
+                ImGui::SliderInt("Manual frame size", &percent, 30, maxPercent, "%d%%",
+                                 ImGuiSliderFlags_AlwaysClamp);
+                const auto [scaledWidth, scaledHeight] = StereoFrameSize(recommendedW, recommendedH,
+                    static_cast<unsigned>(percent), m_frameMaxWidth, m_frameMaxHeight);
+                const int wantW = static_cast<int>(scaledWidth);
+                const int wantH = static_cast<int>(scaledHeight);
+                int fitW = wantW;
+                int fitH = wantH;
+                if (resizeWindow) {
+                    FitWindowToDesktop(wantW, wantH, fitW, fitH);
+                }
+                ImGui::Text("Automatic: %u x %u. Manual: %d x %d",
+                            autoWidth, autoHeight, fitW, fitH);
+                if (fitW < wantW) {
+                    ImGui::TextDisabled("The window size is limited by your desktop.");
+                }
+                if (ImGui::Button("Apply on restart")) {
+                    if (ScheduleCfgResolution(fitW, fitH, resizeWindow)) {
+                        config.autoHeadsetResolution = false;
+                        SaveIniValue(L"AutoHeadsetResolution", 0);
+                        config.forceGameWidth = wantW;
+                        config.forceGameHeight = wantH;
+                        SaveIniValue(L"ForceGameWidth", wantW);
+                        SaveIniValue(L"ForceGameHeight", wantH);
+                        resolutionStatus = "Restart Arma and check the actual scene size in a mission.";
+                        Log("RESOLUTION requested from menu: render %dx%d, resize window=%d",
+                            fitW, fitH, resizeWindow ? 1 : 0);
+                    } else {
+                        resolutionStatus = "Could not schedule the new frame size.";
+                    }
+                }
+                if (resolutionStatus) {
+                    ImGui::TextUnformatted(resolutionStatus);
+                }
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("View and HUD")) {
+            ImGui::SeparatorText("Head tracking");
+            ImGui::Checkbox("Positional head tracking (6DoF)", &m_headPositionOn);
             if (ImGui::Checkbox("Stabilize horizon", &config.stabilizeArmaRoll)) {
                 m_renderEye = -1;
                 m_dibr.ResetHistory();
@@ -294,10 +416,32 @@ void OpenXRRuntime::DrawMenuUi()
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Compensates for the game camera roll, including while aiming or in vehicles.");
             }
-            ImGui::SliderFloat("Right (m)", &m_headOffset[0], -0.3F, 0.3F, "%.2f");
-            ImGui::SliderFloat("Up (m)", &m_headOffset[1], -0.3F, 0.3F, "%.2f");
-            ImGui::SliderFloat("Forward (m)", &m_headOffset[2], -0.3F, 0.3F, "%.2f");
-            ImGui::Checkbox("Positional head tracking (6DoF)", &m_headPositionOn);
+            if (ImGui::CollapsingHeader("Head placement and timing")) {
+                const char* placements[] = {"Default", "On foot", "Vehicle"};
+                ImGui::Combo("Placement profile", &m_vehicleForce, placements, IM_ARRAYSIZE(placements));
+                ImGui::TextDisabled("Adjusting the %s profile", m_vehicleMode ? "vehicle" : "on-foot");
+                ImGui::SliderFloat("Right (m)", &m_headOffset[0], -0.3F, 0.3F, "%.2f");
+                ImGui::SliderFloat("Up (m)", &m_headOffset[1], -0.3F, 0.3F, "%.2f");
+                ImGui::SliderFloat("Forward (m)", &m_headOffset[2], -0.3F, 0.3F, "%.2f");
+                ImGui::SliderInt("Head pose delay (frames)", &m_poseLag, 1, 4);
+            }
+            if (ImGui::CollapsingHeader("HUD")) {
+                ImGui::Checkbox("Hide gameplay HUD", &config.hideGameplayHud);
+                ImGui::Checkbox("Room-anchored HUD panel", &m_hudLockOn);
+                ImGui::Checkbox("Center the marked HUD element", &config.stabilizeHudMarker);
+                ImGui::SliderFloat("Size", &m_hudScale, 0.2F, 1.2F, "%.2f");
+                ImGui::SliderFloat("Horizontal offset", &m_hudShiftX, -0.6F, 0.6F, "%.2f");
+                ImGui::SliderFloat("Vertical offset", &m_hudShiftY, -0.6F, 0.6F, "%.2f");
+                ImGui::SliderFloat("Distance (m)", &m_hudDistance, 0.4F, 6.0F, "%.2f");
+            }
+            if (ImGui::CollapsingHeader("Screen and stereo depth")) {
+                ImGui::SliderFloat("Stereo depth", &m_stereoScale, 0.0F, 3.0F, "%.2f");
+                ImGui::SliderFloat("Virtual screen crop", &m_fovCrop, 0.4F, 1.0F, "%.2f");
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Weapon and optics")) {
+            ImGui::SeparatorText("Weapon");
             ImGui::Checkbox("Keep weapon aligned with body", &m_weaponLockOn);
             if (ImGui::Checkbox("Lean to inspect weapon", &config.weaponHeadPosition)) {
                 if (config.weaponHeadPosition) {
@@ -310,165 +454,104 @@ void OpenXRRuntime::DrawMenuUi()
             if (config.weaponHeadPosition) {
                 ImGui::TextDisabled("Available on foot at normal zoom in full stereo.");
             }
-            ImGui::Checkbox("Hide torso and vest (experimental)", &config.firstPersonHideTorso);
-            ImGui::SliderFloat("Near body clipping (cm)", &config.firstPersonClipCm,
-                               0.0F, 18.0F, "%.0f");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("HUD")) {
-            ImGui::Checkbox("Hide gameplay HUD", &config.hideGameplayHud);
-            ImGui::Checkbox("Room-anchored HUD panel", &m_hudLockOn);
-            ImGui::Checkbox("Center the marked HUD element", &config.stabilizeHudMarker);
-            ImGui::SliderFloat("Size", &m_hudScale, 0.2F, 1.2F, "%.2f");
-            ImGui::SliderFloat("Horizontal offset", &m_hudShiftX, -0.6F, 0.6F, "%.2f");
-            ImGui::SliderFloat("Vertical offset", &m_hudShiftY, -0.6F, 0.6F, "%.2f");
-            ImGui::SliderFloat("Distance (m)", &m_hudDistance, 0.4F, 6.0F, "%.2f");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Weapon and optics")) {
             ImGui::SliderFloat("Weapon size", &m_weaponSize, 0.2F, 1.5F, "%.2f");
             ImGui::SliderFloat("Weapon stereo depth", &m_weaponScale, 0.0F, 2.0F, "%.2f");
-            ImGui::SliderFloat("Zero parallax distance (m)", &m_weaponConvergence, 0.2F, 5.0F,
-                               "%.2f");
-            ImGui::Separator();
+            ImGui::SliderFloat("Zero parallax distance (m)", &m_weaponConvergence, 0.2F, 5.0F, "%.2f");
+
+            ImGui::SeparatorText("Optics");
             ImGui::Checkbox("Magnified optic window", &config.scopeLens);
-            ImGui::SliderFloat("Optic window size (degrees)", &config.scopeLensDegrees, 8.0F, 70.0F,
-                               "%.0f");
+            ImGui::SliderFloat("Optic window size (degrees)", &config.scopeLensDegrees, 8.0F, 70.0F, "%.0f");
             ImGui::Checkbox("Weapon-aligned optic reticle", &config.scopeReticle);
-            ImGui::Checkbox("Use mouse aim through magnified optics",
-                            &config.scopeStatic);
-            ImGui::Checkbox("Center the weapon in both eyes when scoped",
-                            &config.scopeWeaponFlat);
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Image")) {
-            ImGui::SliderFloat("Stereo depth", &m_stereoScale, 0.0F, 3.0F, "%.2f");
-            ImGui::SliderFloat("Virtual screen crop", &m_fovCrop, 0.4F, 1.0F, "%.2f");
-            ImGui::EndTabItem();
-        }
-        if (GetConfig().frameProbe && ImGui::BeginTabItem("Shaders")) {
-            int browseMode = ShaderBrowseMode();
-            const int browseBefore = browseMode;
-            ImGui::RadioButton("Off", &browseMode, 0);
-            ImGui::RadioButton("Screen-space shaders (shadows, light, glow)", &browseMode, 1);
-            ImGui::RadioButton("HUD icons and squad markers", &browseMode, 2);
-            if (browseMode != browseBefore) {
-                ShaderBrowseSetMode(browseMode);
+            ImGui::Checkbox("Use mouse aim through magnified optics", &config.scopeStatic);
+            ImGui::Checkbox("Center the weapon in both eyes when scoped", &config.scopeWeaponFlat);
+
+            if (ImGui::CollapsingHeader("Body clipping")) {
+                ImGui::Checkbox("Hide torso and vest (experimental)", &config.firstPersonHideTorso);
+                ImGui::SliderFloat("Near body clipping (cm)", &config.firstPersonClipCm,
+                                   0.0F, 18.0F, "%.0f");
             }
-            ImGui::TextDisabled("Ctrl+F1 cycles through the modes.");
-            ImGui::TextWrapped("Close settings. PgUp/PgDn skips the selected screen-space shader "
-                               "so you can see which effect it draws. When you find a broken effect, "
-                               "press Del to record the shader in "
-                               "arma3_native_vr.shaders.txt.");
-            if (ImGui::Button("Previous")) {
-                ShaderBrowseStep(-1);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Diagnostics")) {
+            ImGui::SeparatorText("Capture");
+            if (m_quadWidth && m_quadHeight) {
+                ImGui::Text("VR source  %u x %u", m_quadWidth, m_quadHeight);
+            }
+            if (m_eyeRecommendedW && m_eyeRecommendedH) {
+                ImGui::Text("OpenXR recommended per eye  %u x %u", m_eyeRecommendedW, m_eyeRecommendedH);
+            }
+            ImGui::BeginDisabled(m_worldViewState != 1 || !m_sbsInput || !m_projectionEnabled);
+            if (ImGui::Button("Stereo screenshot")) {
+                RequestStereoShots(1);
             }
             ImGui::SameLine();
-            if (ImGui::Button("Next")) {
-                ShaderBrowseStep(1);
+            if (ImGui::Button("Capture 20 stereo screenshots")) {
+                RequestStereoShots(20);
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Mark shader")) {
-                ShaderBrowseMark();
-            }
-            ImGui::TextUnformatted(ShaderBrowseDescribe().c_str());
-            ImGui::Separator();
-            ImGui::TextUnformatted("Marked shaders");
-            for (const std::string& line : ShaderBrowseMarkedLines()) {
-                ImGui::BulletText("%s", line.c_str());
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Rendering")) {
-            ImGui::TextUnformatted("Full stereo");
-            ImGui::Text("VR source: %u x %u", m_quadWidth, m_quadHeight);
-            unsigned sceneWidth = 0, sceneHeight = 0;
-            EngineStereoSceneSize(sceneWidth, sceneHeight);
-            ImGui::Text("Arma scene: %u x %u", sceneWidth, sceneHeight);
-            ImGui::Text("OpenXR recommended per eye: %u x %u", m_eyeRecommendedW, m_eyeRecommendedH);
-            bool automatic = GetConfig().autoHeadsetResolution;
-            const bool resizeWindow = !GetConfig().virtualBackBuffer;
-            static int percent = 0;
-            static bool applied = false;
-            const unsigned recommendedW = m_eyeRecommendedW > 0 ? m_eyeRecommendedW : 2636U;
-            const unsigned recommendedH = m_eyeRecommendedH > 0 ? m_eyeRecommendedH : 2804U;
-            const auto [autoWidth, autoHeight] = StereoFrameSize(recommendedW, recommendedH, 100,
-                m_frameMaxWidth, m_frameMaxHeight);
-            if (ImGui::Checkbox("Automatic 16:9 stereo frame size", &automatic)) {
-                MutableConfig().autoHeadsetResolution = automatic;
-                SaveIniValue(L"AutoHeadsetResolution", automatic ? 1 : 0);
-                if (automatic && !resizeWindow) {
-                    applied = ScheduleCfgResolution(static_cast<int>(autoWidth),
-                                                    static_cast<int>(autoHeight), false);
+            ImGui::EndDisabled();
+
+            if (config.frameProbe && ImGui::CollapsingHeader("Shader diagnostics")) {
+                int browseMode = ShaderBrowseMode();
+                const int browseBefore = browseMode;
+                ImGui::RadioButton("Off", &browseMode, 0);
+                ImGui::RadioButton("Screen-space shaders (shadows, light, glow)", &browseMode, 1);
+                ImGui::RadioButton("HUD icons and squad markers", &browseMode, 2);
+                if (browseMode != browseBefore) {
+                    ShaderBrowseSetMode(browseMode);
                 }
-            }
-            ImGui::Separator();
-            const int maxPercent = std::max(100, static_cast<int>(std::min(
-                m_frameMaxWidth * 100 / std::max(1U, autoWidth),
-                m_frameMaxHeight * 100 / std::max(1U, autoHeight))));
-            if (percent == 0) {
-                const int wantedW = GetConfig().forceGameWidth;
-                percent = !automatic && wantedW > 0 && autoWidth > 0
-                    ? static_cast<int>(std::lround(100.0F * wantedW / autoWidth)) : 100;
-            }
-            percent = std::clamp(percent, 30, maxPercent);
-            ImGui::SliderInt("16:9 stereo frame size", &percent, 30, maxPercent, "%d%%");
-            const auto [scaledWidth, scaledHeight] = StereoFrameSize(recommendedW, recommendedH,
-                static_cast<unsigned>(percent), m_frameMaxWidth, m_frameMaxHeight);
-            const int wantW = static_cast<int>(scaledWidth);
-            const int wantH = static_cast<int>(scaledHeight);
-            int fitW = wantW;
-            int fitH = wantH;
-            if (resizeWindow) {
-                FitWindowToDesktop(wantW, wantH, fitW, fitH);
-            }
-            ImGui::Text("Automatic: %u x %u. Manual: %d x %d",
-                        autoWidth, autoHeight, fitW, fitH);
-            if (fitW < wantW) {
-                ImGui::TextWrapped("The selected size exceeds the desktop, so the window was resized to fit. "
-                                   "Increase desktop resolution to use a larger window. "
-                                   "Virtual Desktop also supports a virtual monitor.");
-            }
-            if (ImGui::Button("Apply manual size")) {
-                MutableConfig().autoHeadsetResolution = false;
-                SaveIniValue(L"AutoHeadsetResolution", 0);
-                MutableConfig().forceGameWidth = wantW;
-                MutableConfig().forceGameHeight = wantH;
-                SaveIniValue(L"ForceGameWidth", wantW);
-                SaveIniValue(L"ForceGameHeight", wantH);
-                applied = ScheduleCfgResolution(fitW, fitH, resizeWindow);
-                Log("RESOLUTION requested from menu: render %dx%d, resize window=%d", fitW, fitH,
-                    resizeWindow ? 1 : 0);
-            }
-            if (applied) {
-                ImGui::TextColored(ImVec4(0.4F, 1.0F, 0.5F, 1.0F),
-                                   "Manual size will be saved on exit.");
-            }
-            ImGui::TextWrapped("Manual size is written to the Arma profile after the game exits.");
-            if (ImGui::CollapsingHeader("Screenshots")) {
-                ImGui::BeginDisabled(m_worldViewState != 1 || !m_sbsInput || !m_projectionEnabled);
-                if (ImGui::Button("Stereo screenshot")) {
-                    RequestStereoShots(1);
+                ImGui::TextDisabled("Ctrl+F1 cycles through the modes.");
+                ImGui::TextWrapped("Close settings. PgUp/PgDn skips the selected screen-space shader "
+                                   "so you can see which effect it draws. When you find a broken effect, "
+                                   "press Del to record the shader in "
+                                   "arma3_native_vr.shaders.txt.");
+                if (ImGui::Button("Previous")) {
+                    ShaderBrowseStep(-1);
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Capture 20 stereo screenshots")) {
-                    RequestStereoShots(20);
+                if (ImGui::Button("Next")) {
+                    ShaderBrowseStep(1);
                 }
-                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button("Mark shader")) {
+                    ShaderBrowseMark();
+                }
+                ImGui::TextUnformatted(ShaderBrowseDescribe().c_str());
+                ImGui::Separator();
+                ImGui::TextUnformatted("Marked shaders");
+                for (const std::string& line : ShaderBrowseMarkedLines()) {
+                    ImGui::BulletText("%s", line.c_str());
+                }
             }
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
     }
+    ImGui::PopItemWidth();
     ImGui::EndChild();
 
-    ImGui::SetCursorPosY(static_cast<float>(kMenuHeight) - 90.0F);
     ImGui::Separator();
-    if (ImGui::Button("Save all settings")) {
+    static double savedAt = -10.0;
+    if (ImGui::Button("Save settings")) {
         SaveAllSettings();
+        savedAt = ImGui::GetTime();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Close")) {
+    if (config.frameProbe) {
+        ImGui::SameLine();
+        if (ImGui::Button("Capture settings panel")) {
+            g_menuScreenshotRequested = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Writes arma3_native_vr.menu.jpg in the game folder.");
+        }
+    }
+    if (ImGui::GetTime() - savedAt < 3.0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Saved");
+    }
+    const char* closeLabel = "Close (Insert or Esc)";
+    const float closeWidth = ImGui::CalcTextSize(closeLabel).x + 2.0F * style.FramePadding.x;
+    ImGui::SameLine(rightEdge - closeWidth);
+    if (ImGui::Button(closeLabel)) {
         Menu::Instance().SetOpen(false);
     }
     ImGui::End();

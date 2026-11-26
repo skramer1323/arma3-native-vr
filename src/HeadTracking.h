@@ -31,9 +31,9 @@ static_assert(sizeof(FreeTrackData) == 92);
 constexpr const char* kFreeTrackMapping = "FT_SharedMem";
 constexpr const char* kFreeTrackMutex = "FT_Mutext";
 constexpr std::size_t kFreeTrackMappingSize = 256;
-// Lab extension past the standard block: FTGetData calls seen by our client DLL.
+// Extension after the standard FreeTrack block: client FTGetData call count.
 constexpr std::size_t kFreeTrackCallCounterOffset = 192;
-// Lab extension: dataId of the sample our client DLL handed to the engine last.
+// Sequence number of the last pose returned to the game.
 constexpr std::size_t kFreeTrackLastReturnedOffset = 196;
 
 class FreeTrackFeed final {

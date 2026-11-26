@@ -2,7 +2,18 @@
 
 #include <openxr/openxr.h>
 
+#include <cmath>
+
 namespace a3vr {
+
+// Keep the angular scale of a static optic while putting its axis at the centre
+// of the image. The game projection and the submitted OpenXR view use this same FOV.
+inline XrFovf CenteredOpticsFov(const XrFovf& fov)
+{
+    const float horizontal = std::atan(0.5F * (std::tan(fov.angleRight) - std::tan(fov.angleLeft)));
+    const float vertical = std::atan(0.5F * (std::tan(fov.angleUp) - std::tan(fov.angleDown)));
+    return {-horizontal, horizontal, vertical, -vertical};
+}
 
 inline XrQuaternionf Multiply(const XrQuaternionf& a, const XrQuaternionf& b)
 {

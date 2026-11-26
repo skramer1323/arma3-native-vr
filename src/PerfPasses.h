@@ -10,6 +10,7 @@ enum class PerfRepeatKind { World, FirstPerson, Overlay, Desktop };
 
 bool PerfGpuPassStart(ID3D11Device* device, ID3D11DeviceContext* context, std::uint64_t present);
 void PerfGpuPassFinish();
+void PerfGpuPassDiscard();
 bool PerfGpuPassCollect(ID3D11DeviceContext* context, UINT64 start, UINT64 end, UINT64 post,
                         const D3D11_QUERY_DATA_TIMESTAMP_DISJOINT& clock);
 

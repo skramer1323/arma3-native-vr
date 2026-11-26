@@ -10,25 +10,11 @@
 
 namespace a3vr {
 
-// Own geometry stereo (EngineStereo=1). Every scene draw the engine issues is
-// repeated once more: the render target is split in two halves (left eye, right
-// eye), and the projection matrix of the second draw is shifted sideways.
-//
-// Evidence (frame probe, build 2.22.0.154089, capture of 2026-11-17):
-//  - PROVEN: every scene vertex shader ends with
-//      o0 = view.x*cb2[0] + view.y*cb2[1] + view.z*cb2[2] + cb2[3]
-//    and cb2 (112 bytes) holds the projection matrix, equal to the export
-//    RVGetProjectionViewTransform. Floats 8 and 12 (cb2[2].x, cb2[3].x) are 0.
-//  - Setting float8 = s*P00*d/C and float12 = -s*P00*d moves the camera by
-//    s*d sideways (s = -1 left, +1 right) and keeps distance C on the screen plane.
-//  - The scene is drawn into 2048x864 targets with an R24G8 depth buffer, the
-//    final image is composed into the 4096x1728 back buffer.
-//
-// The result is a side-by-side picture in the back buffer. The OpenXR side shows
-// the left half to the left eye and the right half to the right eye (SbsInput).
-//
-// Screen-space passes that rebuild positions need the projection of the eye
-// that wrote the depth buffer. The known cascade resolve is patched separately.
+// Scene draws use one projection and viewport per eye. Eligible prepass draws
+// broadcast geometry to both eye viewports from a single submission.
+// On Arma 3 2.22 the scene projection is stored in cb2 and can be checked against
+// RVGetProjectionViewTransform. The X terms account for eye offset and convergence.
+// Screen-space depth reconstruction must use the projection that wrote that eye's depth.
 class StereoDraw final {
 public:
     StereoDraw(ID3D11DeviceContext* context, UINT elementCount, bool instancedOrIndirect);
@@ -60,6 +46,7 @@ private:
     bool m_weapon = false;  // first-person weapon layer (viewport depth 0..0.01)
     bool m_mainWorldDepth = false;
     bool m_foveatedWorld = false;
+    bool m_vrsWorldTarget = false;
     bool m_singlePassStereo = false;
     bool m_firstPersonClip = false;
     Microsoft::WRL::ComPtr<ID3D11GeometryShader> m_bodyMask;
@@ -89,7 +76,8 @@ private:
 
 // Vertex shader created by the engine: remembered if it is a screen-space blit.
 void EngineStereoNoteVertexShader(ID3D11VertexShader* shader, const void* code, SIZE_T length);
-void EngineStereoNotePixelShader(ID3D11PixelShader* shader, std::uint64_t bytecodeHash);
+void EngineStereoNotePixelShader(ID3D11PixelShader* shader, const void* code, SIZE_T size,
+                                std::uint64_t bytecodeHash);
 // Before the real Present: back buffer identity, projection, frame statistics.
 void EngineStereoOnPresent(IDXGISwapChain* swapChain);
 // -1 renders both halves; 0 or 1 renders only that eye's scene geometry.
@@ -110,6 +98,8 @@ struct WorldDrawPoseTrace {
     std::uint32_t returnedAfter = 0;
     bool sampled = false;
     bool viewValid = false;
+    float nativeP00 = 0.0F;
+    float nativeP11 = 0.0F;
     std::array<float, 16> view{};
 };
 void EngineStereoSetPoseFeed(const FreeTrackFeed* feed);
@@ -121,6 +111,7 @@ struct DibrSceneDepth {
 };
 DibrSceneDepth EngineStereoLastDibrDepth();
 bool EngineStereoLastWorldVrs();
+bool EngineStereoLastWorldVrsCoarse();
 bool EngineStereoLastStereoShadow();
 void EngineStereoReadWorldEyeRecords(float (&eyes)[2][8]);
 // From the OpenXR side every frame (hotkeys): on/off, flat (menus), scales.
@@ -133,11 +124,11 @@ void EngineStereoSetHud(bool active, float scale, float shiftX, float shiftY, fl
 void EngineStereoSetWeapon(float separationScale, float convergenceMeters, float sizeScale);
 // Headset projection mode (world view, ProjectionLayer=1): each eye is drawn with the headset's
 // own frustum (tangents left/right/up/down per eye: 8 values) and eye offset, and the frame is
-// submitted as a projection layer (as Tarkov KBM VR does). halfIpdMeters includes the depth scale.
+// submitted as a projection layer. halfIpdMeters includes the depth scale.
 // aimBias: -1 puts the right eye on the sight line while aiming, +1 the left eye, 0 neither
 // (fractions blend in and out).
 void EngineStereoSetHeadset(bool active, float halfIpdMeters, const float tangents[8],
-                            float aimBias);
+                            float aimBias, bool centeredOptics);
 // Head position in projection mode: the camera moves right/up/forward (metres, camera axes) by
 // patching the projection constants (no FreeTrack needed).
 void EngineStereoSetLean(float right, float up, float forward);
@@ -163,6 +154,17 @@ ID3D11Texture2D* EngineStereoHudTexture(UINT& width, UINT& height);
 // Game zoom (scopes) relative to the first world frame: 1 = none. Reset on recentre.
 float EngineStereoZoom();
 float EngineStereoDrawZoom();
+struct EngineZoomTrace {
+    float nativeP00 = 0.0F;
+    float nativeP11 = 0.0F;
+    float reference = 0.0F;
+    float previousReference = 0.0F;
+    float nativeRatio = 0.0F;
+    bool opticsIntent = false;
+    bool referenceUpdated = false;
+    const char* decision = "no_sample";
+};
+EngineZoomTrace EngineStereoLastZoomTrace();
 // True while a magnifying optic is in use and ScopeLens=1 (window view, reticle in the picture).
 bool EngineStereoScopeLens();
 // True while a magnifying optic is up (lens or not): the reticle is drawn in the picture, at the
@@ -178,6 +180,10 @@ bool EngineStereoTargetIsBackBuffer(ID3D11DeviceContext* context);
 void EngineStereoSetAerNative(bool native);
 // Menus, map, inventory (cursor shown): draws are not doubled, the engine draws one normal frame.
 void EngineStereoSetMonoScreen(bool mono);
+void EngineStereoSetInventoryHud(bool active);
+std::uint64_t EngineStereoFrameId();
+void EngineStereoNoteInventoryDraw();
+bool EngineStereoLastInventoryDraw();
 // A separate high-resolution scene output for OpenXR, valid only for the completed frame.
 void EngineStereoSetVirtualBack(bool enabled);
 ID3D11Texture2D* EngineStereoVirtualTexture();

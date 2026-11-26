@@ -12,6 +12,7 @@
 #include "ResolutionHook.h"
 #include "Log.h"
 #include "QuadMath.h"
+#include "WorldShadingRate.h"
 #include "XrPoseMath.h"
 
 #include <imgui.h>
@@ -20,6 +21,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace a3vr {
 namespace {
@@ -220,7 +222,19 @@ bool OpenXRRuntime::CreateSession()
                 layer.layerName);
         }
 
-        const char* extensions[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+        const char* extensions[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
+                                    XR_KHR_VISIBILITY_MASK_EXTENSION_NAME};
+        std::uint32_t extensionCount = 0;
+        bool haveVisibilityMask = false;
+        if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extensionCount, nullptr))) {
+            std::vector<XrExtensionProperties> available(extensionCount, {XR_TYPE_EXTENSION_PROPERTIES});
+            if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount,
+                                                                    &extensionCount, available.data()))) {
+                haveVisibilityMask = std::any_of(available.begin(), available.end(), [](const auto& ext) {
+                    return std::strcmp(ext.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0;
+                });
+            }
+        }
         XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
         strncpy_s(createInfo.applicationInfo.applicationName, "Arma3NativeVR",
                   XR_MAX_APPLICATION_NAME_SIZE - 1);
@@ -230,12 +244,26 @@ bool OpenXRRuntime::CreateSession()
         createInfo.applicationInfo.engineVersion = 1;
         // Virtual Desktop rejects apiVersion 1.1 (KCD1VR trap): ask for 1.0.0.
         createInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-        createInfo.enabledExtensionCount = 1;
+        createInfo.enabledExtensionCount = haveVisibilityMask ? 2U : 1U;
         createInfo.enabledExtensionNames = extensions;
-        if (!Check(xrCreateInstance(&createInfo, &m_instance), "creating instance")) {
+        XrResult created = xrCreateInstance(&createInfo, &m_instance);
+        if (created == XR_ERROR_EXTENSION_NOT_PRESENT && haveVisibilityMask) {
+            haveVisibilityMask = false;
+            createInfo.enabledExtensionCount = 1;
+            created = xrCreateInstance(&createInfo, &m_instance);
+        }
+        if (!Check(created, "creating instance")) {
             m_instance = XR_NULL_HANDLE;
             return false;
         }
+        m_getVisibilityMask = nullptr;
+        if (haveVisibilityMask) {
+            PFN_xrVoidFunction proc = nullptr;
+            if (XR_SUCCEEDED(xrGetInstanceProcAddr(m_instance, "xrGetVisibilityMaskKHR", &proc))) {
+                m_getVisibilityMask = reinterpret_cast<PFN_xrGetVisibilityMaskKHR>(proc);
+            }
+        }
+        Log("World VRS OpenXR visibility mask: %s", m_getVisibilityMask ? "available" : "unavailable");
         XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
         if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &properties))) {
             m_steamVr = std::strncmp(properties.runtimeName, "SteamVR", 7) == 0;
@@ -343,6 +371,8 @@ bool OpenXRRuntime::CreateSession()
 
 void OpenXRRuntime::DestroySession()
 {
+    SetWorldVisibilityContours({});
+    m_visibilityPending = true;
     m_dlssWorld.ResetHistory();
     m_staleEye.ResetHistory();
     m_steamVrSceneSample.Reset();
@@ -381,6 +411,13 @@ void OpenXRRuntime::PollEvents()
         if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             HandleSessionState(
                 reinterpret_cast<const XrEventDataSessionStateChanged*>(&event)->state);
+        } else if (event.type == XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
+            const auto& change = *reinterpret_cast<const XrEventDataVisibilityMaskChangedKHR*>(&event);
+            if (change.session == m_session &&
+                change.viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+                SetWorldVisibilityContours({});
+                m_visibilityPending = true;
+            }
         } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             const auto& change =
                 reinterpret_cast<const XrEventDataReferenceSpaceChangePending&>(event);
@@ -403,6 +440,53 @@ void OpenXRRuntime::PollEvents()
             return;
         }
     }
+}
+
+void OpenXRRuntime::ReadWorldVisibility(const XrView (&views)[2], XrQuaternionf headOrientation)
+{
+    if (!m_getVisibilityMask || !m_visibilityPending) return;
+    m_visibilityPending = false;
+    WorldVisibilityContours contours;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        constexpr auto stereo = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        constexpr auto loop = XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR;
+        XrVisibilityMaskKHR mask{XR_TYPE_VISIBILITY_MASK_KHR};
+        if (XR_FAILED(m_getVisibilityMask(m_session, stereo, eye, loop, &mask)) ||
+            mask.vertexCountOutput < 3 || mask.vertexCountOutput > 4096 ||
+            mask.indexCountOutput < 3 || mask.indexCountOutput > 4096) continue;
+        std::vector<XrVector2f> vertices(mask.vertexCountOutput);
+        std::vector<std::uint32_t> indices(mask.indexCountOutput);
+        mask.vertexCapacityInput = mask.vertexCountOutput;
+        mask.vertexCountOutput = 0;
+        mask.vertices = vertices.data();
+        mask.indexCapacityInput = mask.indexCountOutput;
+        mask.indexCountOutput = 0;
+        mask.indices = indices.data();
+        if (XR_FAILED(m_getVisibilityMask(m_session, stereo, eye, loop, &mask)) ||
+            mask.indexCountOutput < 3 || mask.indexCountOutput > indices.size() ||
+            mask.vertexCountOutput > vertices.size()) continue;
+
+        const auto orientation = Multiply(Conjugate(headOrientation), views[eye].pose.orientation);
+        const auto& fov = m_poseRing[0].fov[eye];
+        const float left = std::tan(fov.angleLeft), right = std::tan(fov.angleRight);
+        const float bottom = std::tan(fov.angleDown), top = std::tan(fov.angleUp);
+        auto& contour = contours[eye];
+        contour.reserve(mask.indexCountOutput);
+        for (unsigned i = 0; i < mask.indexCountOutput; ++i) {
+            if (indices[i] >= mask.vertexCountOutput) break;
+            const auto v = vertices[indices[i]];
+            const auto direction = Rotate(orientation, {v.x, v.y, -1.0F});
+            if (direction.z >= -0.05F || right - left <= 0.2F || top - bottom <= 0.2F) break;
+            const float x = (2.0F * (direction.x / -direction.z) - right - left) / (right - left);
+            const float y = (2.0F * (direction.y / -direction.z) - top - bottom) / (top - bottom);
+            if (!std::isfinite(x) || !std::isfinite(y)) break;
+            contour.push_back({x, y});
+        }
+        if (contour.size() != mask.indexCountOutput) contour.clear();
+    }
+    Log("World VRS OpenXR visibility contours: %zu left, %zu right vertices",
+        contours[0].size(), contours[1].size());
+    SetWorldVisibilityContours(std::move(contours));
 }
 
 void OpenXRRuntime::ApplyLocalSpaceChanges()
@@ -523,9 +607,7 @@ void OpenXRRuntime::PublishHeadPose()
         m_headReferenceValid = true;
         m_headRecenterRequested = false;
         m_aiming = false;  // the aiming baseline belongs to the old reference
-        // F11 also clears the right-click aiming latch (it can disagree with the game after a
-        // missed click, the R key, a reload or a weapon change): the sight is re-aligned like in
-        // the Tarkov mod, where F11 re-centres view, hands and sight together.
+        // Clear the aim latch on recenter because a reload or weapon change can cancel aim in Arma.
         m_adsMouseLatched = false;
         m_adsMousePress = 0;
         m_adsBlend = 0.0F;
@@ -563,9 +645,6 @@ void OpenXRRuntime::PublishHeadPose()
     const bool stereo = config.stereoMode == 1 && m_stereoEnabled && m_worldViewState == 1;
     const int eye = stereo ? ((++m_publishCount & 1U) != 0 ? 1 : -1) : 0;
     const float swap = m_stereoSwap ? -1.0F : 1.0F;
-    // Aiming, as in the Tarkov KBM VR mod: while aiming the view follows the game camera (the
-    // sight line, so bullets go where the sight points); only the head motion since aiming
-    // started turns it further. Aiming = right mouse button held, or the game zoomed in.
     // Head offset from the recentre position (LOCAL space, metres).
     XrVector3f delta{0.0F, 0.0F, 0.0F};
     if (havePosition) {
@@ -575,7 +654,7 @@ void OpenXRRuntime::PublishHeadPose()
     }
     const bool rightMouse = KeyHeld(VK_RBUTTON);
     if (config.adsRightMouseToggle) {
-        const bool gameplayInput = m_worldViewState == 1 && !WindowsCursorShowing() &&
+        const bool gameplayInput = !m_inventoryOpen && m_worldViewState == 1 && !WindowsCursorShowing() &&
             m_window && GetAncestor(m_window, GA_ROOT) ==
                         GetAncestor(GetForegroundWindow(), GA_ROOT);
         const bool plainClick = !KeyHeld(VK_CONTROL) && !KeyHeld(VK_MENU) && !KeyHeld(VK_SHIFT);
@@ -595,10 +674,10 @@ void OpenXRRuntime::PublishHeadPose()
         }
         m_adsMouseDown = rightMouse;
     }
-    const bool opticsInput = m_worldViewState == 1 && (rightMouse || m_adsMouseLatched);
+    const bool opticsInput = !m_inventoryOpen && m_worldViewState == 1 && (rightMouse || m_adsMouseLatched);
     EngineStereoSetOpticsIntent(opticsInput);
-    const bool aimingNow = config.adsLockView && m_worldViewState == 1 &&
-        (opticsInput || (!config.adsRightMouseToggle && EngineStereoZoom() > 1.03F));
+    const bool aimingNow = !m_inventoryOpen && config.adsLockView && m_worldViewState == 1 &&
+        (opticsInput || EngineStereoZoom() > 1.03F);
     if (aimingNow) {
         m_aimOffFrames = 0;
         if (!m_aiming) {
@@ -681,7 +760,7 @@ void OpenXRRuntime::PublishHeadPose()
     bool physicalEyes = false;
     {
         const bool wantProjection = m_projectionEnabled && m_sbsInput && config.engineStereo &&
-                                    m_worldViewState == 1;
+                                    (m_worldViewState == 1 || m_inventoryOpen);
         XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
         bool located = false;
         if (wantProjection) {
@@ -699,6 +778,7 @@ void OpenXRRuntime::PublishHeadPose()
         }
         float tangents[8] = {1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F};
         float half = 0.0F;
+        const bool centeredOptics = located && scopeStatic && config.scopeReticle;
         if (located) {
             const float dx = views[1].pose.position.x - views[0].pose.position.x;
             const float dy = views[1].pose.position.y - views[0].pose.position.y;
@@ -721,11 +801,15 @@ void OpenXRRuntime::PublishHeadPose()
                 const XrFovf& fov = views[i].fov;
                 m_poseRing[0].fov[i] = {fov.angleLeft + cantYaw, fov.angleRight + cantYaw,
                                         fov.angleUp + cantPitch, fov.angleDown + cantPitch};
+                if (centeredOptics) {
+                    m_poseRing[0].fov[i] = CenteredOpticsFov(m_poseRing[0].fov[i]);
+                }
                 tangents[i * 4 + 0] = -std::tan(m_poseRing[0].fov[i].angleLeft);
                 tangents[i * 4 + 1] = std::tan(m_poseRing[0].fov[i].angleRight);
                 tangents[i * 4 + 2] = std::tan(m_poseRing[0].fov[i].angleUp);
                 tangents[i * 4 + 3] = -std::tan(m_poseRing[0].fov[i].angleDown);
             }
+            ReadWorldVisibility(views, location.pose.orientation);
             static int viewLogs = 0;
             if (viewLogs++ < 3) {
                 Log("PROJECTION headset eyes: ipd=%.1f mm, left tan l/r/u/d = %.3f %.3f %.3f %.3f, "
@@ -738,7 +822,7 @@ void OpenXRRuntime::PublishHeadPose()
         m_poseRing[0].aimBias = aimBias;
         m_poseRing[0].viewsValid = located;
         m_poseRing[0].projection = located;
-        EngineStereoSetHeadset(located, half, tangents, aimBias);
+        EngineStereoSetHeadset(located, half, tangents, aimBias, centeredOptics);
     }
     m_poseRing[0].physicalEyes = physicalEyes;
     m_poseRing[0].halfBaseline = halfBaseline;
@@ -764,10 +848,7 @@ void OpenXRRuntime::PublishHeadPose()
             tz = std::clamp(-inCamera.z * scale, -limit, limit);
         }
         EngineStereoSetLean(tx, ty, tz);
-        // Aiming (like the ADS camera of the Tarkov mod): the eye goes onto the sight line, so the
-        // sideways/vertical head placement fades out while the sight is up. Otherwise the sight is
-        // seen from a point beside the bore and the collimator mark does not sit where the bullets
-        // go (seen 2026-11-19 with HeadOffset right 0.02 up 0.04). The depth part stays.
+        // Fade horizontal and vertical head offsets while aiming to align the eye with the sight.
         const float placementKeep = 1.0F - m_adsBlend;
         EngineStereoSetHeadOffset(m_appliedOffset[0] * placementKeep,
                                   m_appliedOffset[1] * placementKeep, m_appliedOffset[2]);
@@ -1046,6 +1127,7 @@ bool OpenXRRuntime::EnsureQuadSwapchain(const D3D11_TEXTURE2D_DESC& backBuffer)
         m_quadHeight == backBuffer.Height && m_quadSourceFormat == backBuffer.Format) {
         return true;
     }
+    const double reconfigureStarted = PerfNowMs();
     DestroyQuadSwapchain();
     std::uint32_t count = 0;
     xrEnumerateSwapchainFormats(m_session, 0, &count, nullptr);
@@ -1095,9 +1177,10 @@ bool OpenXRRuntime::EnsureQuadSwapchain(const D3D11_TEXTURE2D_DESC& backBuffer)
         m_quadImages[0].texture->GetDesc(&imageDescription);
     }
     Log("RUNG3 quad swapchain %ux%u images=%u source format=%d OpenXR format=%d "
-        "image texture format=%d",
+        "image texture format=%d reconfigure=%.2f ms CPU",
         m_quadWidth, m_quadHeight, imageCount, static_cast<int>(backBuffer.Format),
-        static_cast<int>(format), static_cast<int>(imageDescription.Format));
+        static_cast<int>(format), static_cast<int>(imageDescription.Format),
+        PerfNowMs() - reconfigureStarted);
     return true;
 }
 
@@ -1834,7 +1917,7 @@ void OpenXRRuntime::SaveProjectionEyeImages(ID3D11Texture2D* frame, int rendered
             }
         }
     }
-    if (!GetConfig().detailedCapture) {
+    if (!GetConfig().frameProbe) {
         return;
     }
     const int capture = FrameProbeCaptureNumber();
@@ -1849,8 +1932,17 @@ void OpenXRRuntime::SaveProjectionEyeImages(ID3D11Texture2D* frame, int rendered
     if (m_presents - m_eyeCaptureStart > 4 || m_eyeCaptureMask == 3U) {
         return;
     }
-    WriteEyeImages(frame, renderedEye, synthetic, fullEye, warpedEye,
-                   L"arma3_native_vr.frame" + std::to_wstring(capture), m_eyeCaptureMask, capture);
+    const std::wstring name = L"arma3_native_vr.frame" + std::to_wstring(capture);
+    WriteEyeImages(frame, renderedEye, synthetic, fullEye, warpedEye, name, m_eyeCaptureMask, capture);
+    if (m_eyeCaptureMask == 3U) {
+        UINT width = 0, height = 0;
+        if (auto* hud = EngineStereoHudTexture(width, height)) {
+            const auto path = (ModuleDirectory() / (name + L".hud.jpg")).wstring();
+            if (DumpTextureJpeg(hud, path.c_str())) {
+                Log("PROBE HUD image written for capture %d (%ux%u)", capture, width, height);
+            }
+        }
+    }
 }
 
 void OpenXRRuntime::RequestStereoShots(int pairs)
@@ -1897,9 +1989,8 @@ void OpenXRRuntime::WriteEyeImages(ID3D11Texture2D* frame, int renderedEye, bool
     }
 }
 
-// The HUD as a panel fixed in the room in front of the recentre direction (Tarkov KBM VR,
-// HudLayer): the UI draws of the world view were collected into one texture.
-bool OpenXRRuntime::BuildHudLayer(XrCompositionLayerQuad& hud)
+// Present the captured HUD or inventory texture on the room-anchored panel.
+bool OpenXRRuntime::BuildHudLayer(XrCompositionLayerQuad& hud, bool inventory)
 {
     UINT width = 0;
     UINT height = 0;
@@ -1969,14 +2060,13 @@ bool OpenXRRuntime::BuildHudLayer(XrCompositionLayerQuad& hud)
     if (!ready || !released) {
         return false;
     }
-    // Size and place: the panel keeps the angular size the in-picture HUD had (HudScale of the
-    // eye image) at HudDistanceMeters; HudShift moves it, as before.
-    const float distance = std::max(0.4F, m_hudDistance);
-    const float spanX = 1.9F * distance * m_hudScale;  // eye image ~ 1.9 tan units wide
-    const float spanY = spanX * static_cast<float>(height) / static_cast<float>(width);
-    const XrVector3f offset = Rotate(
-        m_headReference,
-        {m_hudShiftX * 1.9F * distance, m_hudShiftY * 2.0F * distance, -distance});
+    // Both panels use the saved position and forward direction from F11. Inventory
+    // keeps the screen's angular size and is centred at the saved eye height.
+    const float distance = inventory ? m_quadDistanceMeters : std::max(0.4F, m_hudDistance);
+    const float spanX = inventory ? m_quadWidthMeters : 1.9F * distance * m_hudScale;
+    const float shiftX = inventory ? 0.0F : m_hudShiftX * 1.9F * distance;
+    const float shiftY = inventory ? 0.0F : m_hudShiftY * 2.0F * distance;
+    const XrVector3f offset = Rotate(m_headReference, {shiftX, shiftY, -distance});
     hud.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
     hud.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     hud.space = m_localSpace;
@@ -1988,11 +2078,11 @@ bool OpenXRRuntime::BuildHudLayer(XrCompositionLayerQuad& hud)
     hud.pose.orientation = m_headReference;
     hud.pose.position = {m_headOrigin.x + offset.x, m_headOrigin.y + offset.y,
                          m_headOrigin.z + offset.z};
-    hud.size = {spanX, spanY};
-    if (m_hudLogs++ < 3) {
+    hud.size = {spanX, QuadHeightMeters(spanX, width, height)};
+    if (!inventory && m_hudLogs++ < 3) {
         Log("HUD quad: %.2f x %.2f m at %.2f m, fixed in the room in front of the recentre "
             "direction",
-            spanX, spanY, distance);
+            hud.size.width, hud.size.height, distance);
     }
     return true;
 }
@@ -2021,6 +2111,7 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
     bool submittedSteamVrQuads = false;
     std::uint32_t drawPoseId = 0;
     float submittedRoll = 0.0F;
+    OpticsSubmitTrace opticsTrace;
 
     if (m_poseRing[0].valid) {
         const XrVector3f forward = Rotate(m_poseRing[0].head.orientation, {0.0F, 0.0F, -1.0F});
@@ -2038,7 +2129,8 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
     if (!m_shouldRender) {
         ++m_notRendered;
     }
-    const double traceStart = GetConfig().detailedCapture ? NowMs() : 0.0;
+    const bool captureDetails = GetConfig().detailedCapture;
+    const double traceStart = captureDetails ? NowMs() : 0.0;
     std::uint32_t matchedPose = 0;
     bool dlssApplied = false;
     bool staleWarpApplied = false;
@@ -2054,9 +2146,17 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
         backBuffer->GetDesc(&windowDescription);
         VirtualCursorSetPicture(static_cast<int>(windowDescription.Width),
                                 static_cast<int>(windowDescription.Height));
-        // Cursor hidden = gameplay: show the world around the player. Cursor
-        // shown = menu, map, inventory: keep the room-fixed screen.
+        // The inventory is an interactive panel over the world. Other cursor-driven
+        // displays still use their original flat screen.
         const bool cursorShowing = WindowsCursorShowing();
+        m_inventoryOpen = GetConfig().inventoryInVr && GetConfig().monoScreen &&
+            GetConfig().virtualBackBuffer && GetConfig().headTracking && m_worldViewEnabled &&
+            m_projectionEnabled && m_sbsInput && EngineStereoLastInventoryDraw();
+        ID3D11Texture2D* independentScene = EngineStereoVirtualTexture();
+        UINT inventoryWidth = 0, inventoryHeight = 0;
+        const bool inventoryWorld = m_inventoryOpen && independentScene &&
+            m_poseRing[0].projection && m_poseRing[0].viewsValid &&
+            EngineStereoHudTexture(inventoryWidth, inventoryHeight);
         int poseBaseIndex = 0;
         RenderPose renderPose = m_poseRing[std::clamp(m_poseLag, 1, 4) - 1];
         if (GetConfig().poseBySequence && GetConfig().headTracking) {
@@ -2073,15 +2173,24 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
             if (found >= 0) {
                 poseBaseIndex = found;
                 renderPose = m_poseRing[std::min(found + std::clamp(m_poseLag, 1, 4) - 1, 7)];
+                m_lastConsumedPose = m_poseRing[found];
                 ++m_poseHits[found];
             } else {
+                // While a dialog owns input the game can stop polling FreeTrack. Keep the
+                // pose behind the rendered image even after it has aged out of the ring.
+                if (m_inventoryOpen && used != 0 && m_lastConsumedPose.sequence == used &&
+                    m_lastConsumedPose.headReferenceEpoch == m_headReferenceEpoch) {
+                    renderPose = m_lastConsumedPose;
+                }
                 ++m_poseHits[8];
             }
         }
         matchedPose = renderPose.sequence;
         const bool worldView = GetConfig().headTracking && m_worldViewEnabled &&
-                               renderPose.valid && m_headReferenceValid && !cursorShowing;
-        ID3D11Texture2D* worldTexture = worldView ? EngineStereoVirtualTexture() : nullptr;
+                               renderPose.valid && m_headReferenceValid &&
+                               (inventoryWorld || (!cursorShowing && !m_inventoryOpen));
+        ID3D11Texture2D* worldTexture = worldView ? independentScene : nullptr;
+        opticsTrace.source = worldView && worldTexture ? "independent_scene" : "desktop_backbuffer";
         if (worldTexture) {
             backBuffer = worldTexture;
         }
@@ -2117,7 +2226,7 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
             (!m_poseRing[0].sightActive && !m_poseRing[0].scopeStatic &&
              !EngineStereoScopeUi() &&
              (!m_dibrShift || std::fabs(EngineStereoDrawZoom() - 1.0F) <= 0.001F));
-        const bool useAer = !staleMode && m_alternateEyeProjection && aerPair &&
+        const bool useAer = !inventoryWorld && !staleMode && m_alternateEyeProjection && aerPair &&
                             m_sbsInput && m_projectionEnabled && worldView && m_poseRing[0].projection &&
                             m_stereoEnabled && !m_headRecenterRequested && !m_calibration.Active() &&
                             !(m_poseRing[0].scopeStatic && renderedEye < 0);
@@ -2136,7 +2245,8 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
         const bool regularProjection = worldTexture && m_sbsInput && m_projectionEnabled &&
             m_poseRing[0].projection && m_poseRing[0].viewsValid && !EngineStereoScopeUi() &&
             EngineStereoDrawZoom() <= 1.03F && !m_poseRing[0].scopeStatic;
-        const bool staleCandidate = staleMode && regularProjection && !m_poseRing[0].sightActive && m_stereoEnabled &&
+        const bool staleCandidate = !inventoryWorld && staleMode && regularProjection &&
+            !m_poseRing[0].sightActive && m_stereoEnabled &&
             !m_headRecenterRequested && !m_recenterRequested && !m_calibration.Active();
         const bool hasNativeNear = depth.weaponMax > depth.weaponMin || EngineStereoLastWeaponDraws() == 0;
         const auto stereoCamera = [&](bool capturedView) {
@@ -2263,12 +2373,29 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
         if (staleWarpApplied && !dlssApplied) {
             backBuffer->GetDesc(&description);
         }
+        const int casStrength = GetConfig().casSharpnessPercent;
+        const bool vrsActive = EngineStereoLastWorldVrs();
+        const bool previewRadius = vrsActive &&
+            (GetConfig().worldVrsShowRings || (Menu::Instance().IsOpen() && m_vrsRadiusPreview));
+        if ((casStrength > 0 || previewRadius) && regularProjection && m_stereoEnabled && !useAer && legacyEye < 0 &&
+            !staleMode && !dlssApplied && !m_poseRing[0].sightActive && !m_calibration.Active()) {
+            WorldShadingGuide guide;
+            const bool hasGuide = vrsActive && GetWorldShadingGuide(description.Width, description.Height, guide);
+            const bool sample = PerfEnabled() && m_presents % 30 == 0;
+            if (sample) PerfCasGpuTimer().Begin(m_device.Get(), m_context.Get());
+            ID3D11Texture2D* sharpened = m_stereoCas.Render(m_context.Get(), backBuffer, casStrength,
+                                                          hasGuide ? &guide : nullptr,
+                                                          previewRadius && hasGuide);
+            if (sample) PerfCasGpuTimer().End(m_context.Get());
+            if (sharpened) backBuffer = sharpened;
+        }
         // Scope lens: alternating frames. Pass 1 = world at normal scale, pass 2 = the magnified
         // window; each goes to its own swapchain and both are submitted every frame.
         const int lensPass =
             (worldView && m_sbsInput && m_projectionEnabled && m_poseRing[0].projection &&
              m_poseRing[0].viewsValid && m_stereoEnabled && !useAer && renderedEye < 0) ?
                 EngineStereoLensPass() : 0;
+        opticsTrace.lensPass = lensPass;
         if (lensPass == 0) {
             m_lensWorldValid = false;
             m_lensWindowValid = false;
@@ -2470,6 +2597,11 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
                     const float windowDivisor =
                         scopeLens ? 1.0F :
                         (zoom > 1.0F ? std::pow(zoom, 1.0F - GetConfig().zoomMagnification) : zoom);
+                    opticsTrace.windowDivisor = windowDivisor;
+                    if (captureDetails) {
+                        opticsTrace.unzoomedEyeSpan =
+                            std::tan(stereoPose.fov[0].angleRight) - std::tan(stereoPose.fov[0].angleLeft);
+                    }
                     const float separationDivisor =
                         zoom > 1.0F ? std::pow(zoom, 0.5F * GetConfig().zoomMagnification) : 1.0F;
                     const std::int32_t half = static_cast<std::int32_t>(m_quadWidth / 2);
@@ -2671,6 +2803,7 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
                         lensProjection.views = m_lensWindowViews;
                         layers[layerCount++] =
                             reinterpret_cast<const XrCompositionLayerBaseHeader*>(&lensProjection);
+                        opticsTrace.lensSubmitted = true;
                     }
                     ++m_stereoFrames;
                 } else if (m_sbsInput && layerCount == 2) {
@@ -2723,16 +2856,19 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
                     Log("VIEW %s", worldView ? "world (head look)" : "screen");
                 }
             }
-            if (worldView && GetConfig().hudQuad && !GetConfig().hideGameplayHud && m_hudLockOn &&
-                layerCount < 4 &&
-                !EngineStereoScopeUi() &&
-                BuildHudLayer(hudQuad)) {
+            const bool inventoryPanel = worldView && inventoryWorld && BuildHudLayer(hudQuad, true);
+            if (inventoryPanel || (worldView && GetConfig().hudQuad && !GetConfig().hideGameplayHud &&
+                m_hudLockOn && layerCount < 4 && !EngineStereoScopeUi() && BuildHudLayer(hudQuad, false))) {
                 layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hudQuad);
+            }
+            if (m_inventoryPresented != inventoryPanel) {
+                m_inventoryPresented = inventoryPanel;
+                Log("Inventory VR: %s", inventoryPanel ? "stereo world + F11-anchored panel" : "panel closed");
             }
             if (cursorDrawnIntoScreen) {
                 ++m_cursorFrames;
-            } else if (!worldView && !Menu::Instance().IsOpen() && GetConfig().drawCursor &&
-                       BuildCursorLayer(quad, cursorQuad)) {
+            } else if ((inventoryPanel || !worldView) && !Menu::Instance().IsOpen() && GetConfig().drawCursor &&
+                       BuildCursorLayer(inventoryPanel ? hudQuad : quad, cursorQuad)) {
                 layers[layerCount++] =
                     reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cursorQuad);
                 ++m_cursorFrames;
@@ -2767,7 +2903,7 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
         m_context->Flush();
     }
     const XrResult result = xrEndFrame(m_session, &endInfo);
-    if (GetConfig().detailedCapture) {
+    if (captureDetails) {
         const bool projected = layerCount > 0 &&
             layers[0] == reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
         const bool dlssSubmitted = dlssApplied && projected && XR_SUCCEEDED(result);
@@ -2781,7 +2917,7 @@ bool OpenXRRuntime::SubmitPreparedFrame(ID3D11Texture2D* backBuffer, bool withQu
         TraceSubmittedFrame(renderedEye, matchedPose, layerCount, projectionViews,
                             result, NowMs() - traceStart, dlssSubmitted, staleWarpSubmitted,
                             viewKind, viewSpace, projected || submittedSteamVrQuads ? drawPoseId : 0,
-                            submittedRoll);
+                            submittedRoll, opticsTrace);
     }
     if (Check(result, "ending frame")) {
         if (rememberStalePair && GetConfig().staleEyeWarp) {
@@ -2801,7 +2937,7 @@ void OpenXRRuntime::TraceSubmittedFrame(
     int renderedEye, std::uint32_t matchedPose, std::uint32_t layerCount,
     const XrCompositionLayerProjectionView views[2], XrResult result, double submitMs,
     bool dlssSubmitted, bool staleWarpSubmitted, const char* viewKind, const char* viewSpace,
-    std::uint32_t drawPoseId, float submittedRoll)
+    std::uint32_t drawPoseId, float submittedRoll, const OpticsSubmitTrace& optics)
 {
     if (!m_frameTraceAttempted) {
         m_frameTraceAttempted = true;
@@ -2834,7 +2970,11 @@ void OpenXRRuntime::TraceSubmittedFrame(
             }
             m_frameTrace << ",submit_draw_pose_id,submit_camera_roll_deg,"
                             "world_yaw_correction_right_m,world_yaw_correction_up_m,"
-                            "world_yaw_correction_forward_m\n";
+                            "world_yaw_correction_forward_m,world_vrs_4x4,"
+                            "probe_capture,zoom_draw_p00,zoom_draw_p11,zoom_present_p00,zoom_present_p11,"
+                            "zoom_reference_before,zoom_reference,zoom_raw_ratio,zoom_reference_updated,zoom_optics_intent,"
+                            "zoom_gate,zoom_selected,zoom_config,zoom_window_divisor,zoom_xr_fov_ratio,"
+                            "zoom_source,zoom_scope_ui,zoom_scope_static,zoom_lens_pass,zoom_lens_submitted\n";
             m_frameTrace.precision(12);
         }
     }
@@ -2921,8 +3061,34 @@ void OpenXRRuntime::TraceSubmittedFrame(
     for (float offset : worldCamera.yawOrbitCorrection) {
         m_frameTrace << ',' << offset;
     }
-    m_frameTrace << '\n';
-    if (m_presents % 60 == 0) {
+    const auto zoom = EngineStereoLastZoomTrace();
+    const float submittedSpan = optics.windowDivisor > 0.0F
+        ? std::tan(views[0].fov.angleRight) - std::tan(views[0].fov.angleLeft) : 0.0F;
+    const float fovRatio = optics.unzoomedEyeSpan > 0.0F && submittedSpan > 0.0F
+        ? optics.unzoomedEyeSpan / submittedSpan : 0.0F;
+    const int capture = FrameProbeCaptureNumber();
+    const bool captureStarted = capture > m_opticsProbeCapture;
+    m_frameTrace << ',' << EngineStereoLastWorldVrsCoarse() << ',' << (captureStarted ? capture : 0)
+                 << ',' << draw.nativeP00 << ',' << draw.nativeP11 << ',' << zoom.nativeP00
+                 << ',' << zoom.nativeP11 << ',' << zoom.previousReference << ',' << zoom.reference
+                 << ',' << zoom.nativeRatio
+                 << ',' << zoom.referenceUpdated << ',' << zoom.opticsIntent << ',' << zoom.decision
+                 << ',' << EngineStereoZoom() << ',' << config.zoomMagnification
+                 << ',' << optics.windowDivisor << ',' << fovRatio << ',' << optics.source
+                 << ',' << EngineStereoScopeUi() << ',' << pose.scopeStatic << ',' << optics.lensPass
+                 << ',' << optics.lensSubmitted << '\n';
+    if (captureStarted) {
+        m_opticsProbeCapture = capture;
+        Log("OPTICS probe %d present=%llu source=%s view=%s: draw P00/P11=%.4f/%.4f "
+            "Present P00/P11=%.4f/%.4f base=%.4f->%.4f raw=%.2fx input=%d baseUpdated=%d decision=%s "
+            "selected=%.2fx drawn=%.2fx window=%.3f xrFovRatio=%.2f lensPass=%d lensLayer=%d",
+            capture, static_cast<unsigned long long>(m_presents), optics.source, viewKind,
+            draw.nativeP00, draw.nativeP11, zoom.nativeP00, zoom.nativeP11, zoom.previousReference, zoom.reference,
+            zoom.nativeRatio, zoom.opticsIntent, zoom.referenceUpdated, zoom.decision,
+            EngineStereoZoom(), EngineStereoDrawZoom(), optics.windowDivisor, fovRatio,
+            optics.lensPass, optics.lensSubmitted);
+    }
+    if (captureStarted || m_presents % 60 == 0) {
         m_frameTrace.flush();
     }
 }
@@ -2977,18 +3143,37 @@ void OpenXRRuntime::HandleHotkeys()
     const bool recenter = KeyEdge(VK_F11, recenterHeld);
     const bool insert = KeyEdge(VK_INSERT, insertHeld);
     const bool escape = KeyEdge(VK_ESCAPE, escapeHeld);
-    if ((!recenter && !insert && !escape) || KeyHeld(VK_CONTROL) || KeyHeld(VK_MENU) ||
-        KeyHeld(VK_SHIFT) || !m_window ||
+    static bool browserToggleHeld = false;
+    static bool previousHeld = false;
+    static bool nextHeld = false;
+    static bool markHeld = false;
+    const bool cycleBrowser = KeyEdge(VK_F1, browserToggleHeld) && KeyHeld(VK_CONTROL);
+    const bool previousShader = KeyEdge(VK_PRIOR, previousHeld);
+    const bool nextShader = KeyEdge(VK_NEXT, nextHeld);
+    const bool markShader = KeyEdge(VK_DELETE, markHeld);
+    const bool menuOpen = Menu::Instance().IsOpen();
+    const bool browseKeys = ShaderBrowseEnabled() && !menuOpen &&
+                            (previousShader || nextShader || markShader);
+    if ((!recenter && !insert && !escape && !browseKeys && !cycleBrowser) ||
+        KeyHeld(VK_MENU) || KeyHeld(VK_SHIFT) || !m_window ||
         GetAncestor(m_window, GA_ROOT) != GetAncestor(GetForegroundWindow(), GA_ROOT)) {
         return;
     }
-    if (insert) {
-        if (!Menu::Instance().IsOpen()) {
-            PlaceMenu();
+    if (KeyHeld(VK_CONTROL)) {
+        if (cycleBrowser && GetConfig().frameProbe && !menuOpen) {
+            ShaderBrowseSetMode((ShaderBrowseMode() + 1) % 3);
         }
+        return;
+    }
+    if (insert) {
+        if (!menuOpen) PlaceMenu();
         Menu::Instance().Toggle();
-    } else if (escape && Menu::Instance().IsOpen()) {
+    } else if (escape && menuOpen) {
         Menu::Instance().SetOpen(false);
+    } else if (browseKeys) {
+        if (previousShader) ShaderBrowseStep(-1);
+        if (nextShader) ShaderBrowseStep(1);
+        if (markShader) ShaderBrowseMark();
     }
     if (recenter) {
         m_headRecenterRequested = true;
@@ -3023,6 +3208,16 @@ void OpenXRRuntime::LogStats()
                 (client.right == static_cast<LONG>(m_quadWidth) &&
                  client.bottom == static_cast<LONG>(m_quadHeight))
                     ? " (match)" : " (differs: the virtual cursor maps the whole picture)");
+        }
+    }
+    if (m_worldViewState == 1 && EngineStereoPerfWorld() && m_startupSceneRequest.first) {
+        std::pair<unsigned, unsigned> actual{};
+        EngineStereoSceneSize(actual.first, actual.second);
+        if (actual.first && actual.second && actual != m_reportedSceneExtent) {
+            m_reportedSceneExtent = actual;
+            Log("RESOLUTION mission scene actual %ux%u, startup request %ux%u (%s)",
+                actual.first, actual.second, m_startupSceneRequest.first, m_startupSceneRequest.second,
+                actual == m_startupSceneRequest ? "applied" : "different");
         }
     }
     const ULONGLONG now = GetTickCount64();
@@ -3092,6 +3287,12 @@ void OpenXRRuntime::LogStats()
     m_submitMsSum = 0.0;
     m_maxPresentGapMs = 0.0;
     m_notRendered = 0;
+}
+
+bool OpenXRRuntime::IsMainSwapChain(IDXGISwapChain* swapChain)
+{
+    std::scoped_lock lock(m_mutex);
+    return m_mainSwapChain == swapChain;
 }
 
 bool OpenXRRuntime::OnPresent(IDXGISwapChain* swapChain)
@@ -3171,10 +3372,16 @@ bool OpenXRRuntime::OnPresent(IDXGISwapChain* swapChain)
         m_depthReversed = GetConfig().depthReversed;
         m_sbsInput = GetConfig().sbsInput;
         m_stereoSwap = GetConfig().stereoSwapEyes;
+        const Config& resolution = GetConfig();
+        if (resolution.virtualBackBuffer && !resolution.autoHeadsetResolution &&
+            resolution.forceGameWidth > 0 && resolution.forceGameHeight > 0) {
+            m_startupSceneRequest = {static_cast<unsigned>(resolution.forceGameWidth),
+                                     static_cast<unsigned>(resolution.forceGameHeight)};
+        }
         m_tuningInitialized = true;
     }
     // The stereo buffer keeps both eye regions. Menus use matching views without parallax.
-    EngineStereoSetTuning(true, WindowsCursorShowing() || !m_stereoEnabled, m_stereoScale,
+    EngineStereoSetTuning(true, (WindowsCursorShowing() && !m_inventoryOpen) || !m_stereoEnabled, m_stereoScale,
                           m_convergenceMeters);
     EngineStereoSetHud(m_worldViewState == 1 && m_sbsInput, m_hudScale, m_hudShiftX, m_hudShiftY,
                        m_hudDistance);
@@ -3255,11 +3462,16 @@ void OpenXRRuntime::PrepareFollowingFrame()
     PrepareNextFrame();
     HandleHotkeys();
     const auto& config = GetConfig();
-    EngineStereoSetDesktopHudMirror(!m_steamVr || !config.steamVrWorldQuad || config.steamVrMirrorHud);
+    const bool cursorShowing = WindowsCursorShowing();
+    EngineStereoSetDesktopHudMirror(cursorShowing || !m_steamVr || !config.steamVrWorldQuad || config.steamVrMirrorHud);
     m_renderEye = -1;
     EngineStereoSetRenderEye(-1);
     EngineStereoSetAerNative(false);
-    EngineStereoSetMonoScreen(GetConfig().monoScreen && WindowsCursorShowing());
+    EngineStereoSetInventoryHud(m_inventoryOpen);
+    EngineStereoSetMonoScreen(config.monoScreen && cursorShowing && !m_inventoryOpen);
+    if (m_inventoryOpen) {
+        EngineStereoSetTuning(true, !m_stereoEnabled, m_stereoScale, m_convergenceMeters);
+    }
     EngineStereoSetVirtualBack(GetConfig().virtualBackBuffer && GetConfig().monoScreen &&
                                m_projectionEnabled && m_sbsInput && m_poseRing[0].projection);
 }

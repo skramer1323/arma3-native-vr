@@ -1,6 +1,9 @@
 #include "QuadMath.h"
 #include "XrPoseMath.h"
 #include "WorldShadingMask.h"
+#include "VrsPixelShader.h"
+#include "OpticsZoom.h"
+#include "InventoryLayout.h"
 
 #include <cmath>
 #include <cstdio>
@@ -27,6 +30,49 @@ bool Near(float a, float b, float tolerance = 1e-3F)
 int main()
 {
     using namespace a3vr;
+
+    Expect(IsInventoryCloseButton(0.630303F, 0.555556F, 0.665151F, 0.507071F),
+           "the captured inventory close button matches the stock inventory layout");
+    Expect(IsInventoryCloseButton(0.504F, 0.444F, 0.532F, 0.4054F),
+           "the inventory layout scales with interface size");
+    Expect(!IsInventoryCloseButton(0.630303F, 0.579798F, 0.672121F, 0.526465F) &&
+           !IsInventoryCloseButton(0.95F, 1.0F, 1.0F, 0.93F),
+           "the group screen and map close buttons are not classified as inventory");
+
+    constexpr float normalProjection = 0.5673759F;
+    constexpr float binocularLow = 1.7021277F, binocularHigh = 34.042553F;
+    Expect(ValidZoomProjection(binocularHigh, 47.058823F, 1.0F) &&
+           !ValidZoomProjection(binocularHigh, 0.0F, 1.0F) &&
+           !ValidZoomProjection(binocularHigh, 47.058823F, 0.0F),
+           "valid high-power optics are accepted without accepting a bad projection");
+    Expect(Near(NativeOpticsZoom(binocularLow, normalProjection, true, false), 3.0F) &&
+           Near(NativeOpticsZoom(binocularHigh, normalProjection, true, false), 60.0F),
+           "keyboard binoculars follow native magnification through the 20x step");
+    Expect(!NativeZoomMayUpdateReference(binocularLow, normalProjection, false) &&
+           NativeZoomMayUpdateReference(normalProjection * 1.2F, normalProjection, false) &&
+           Near(NativeOpticsZoom(normalProjection * 1.2F, normalProjection, true, false), 1.0F),
+           "normal camera changes may update the reference, optics cannot consume it");
+    constexpr float vehicleProjection = 0.4728F;
+    constexpr float hunterSight = 0.9726F;
+    const bool hunterEntered = KeepNativeOptics(hunterSight, vehicleProjection, true, false);
+    const bool hunterReleased = KeepNativeOptics(hunterSight, vehicleProjection, false, hunterEntered);
+    Expect(hunterEntered && hunterReleased &&
+           Near(NativeOpticsZoom(hunterSight, vehicleProjection, true, hunterReleased),
+                hunterSight / vehicleProjection) &&
+           !KeepNativeOptics(vehicleProjection, vehicleProjection, false, hunterReleased) &&
+           !KeepNativeOptics(hunterSight, vehicleProjection, false, false),
+           "the Hunter sight keeps its first zoom after release until the normal view returns");
+    for (const float eye : {-1.0F, 1.0F}) {
+        const float left = 0.9505F - eye * 0.2305F;
+        const float right = 0.9505F + eye * 0.2305F;
+        const auto fov = CenteredOpticsFov({-std::atan(left), std::atan(right),
+                                           std::atan(0.829F), -std::atan(1.226F)});
+        Expect(fov.angleLeft == -fov.angleRight && fov.angleDown == -fov.angleUp,
+               "the optic axis is at the image centre in both eyes");
+        Expect(Near(2.0F * std::tan(fov.angleRight), left + right) &&
+               Near(2.0F * std::tan(fov.angleUp), 0.829F + 1.226F),
+               "the centred optic preserves the horizontal and vertical projection scale");
+    }
 
     Expect(Near(QuadHeightMeters(2.4F, 2560, 1440), 1.35F), "16:9 height");
     Expect(Near(QuadHeightMeters(1.6F, 0, 0), 0.9F), "fallback height");
@@ -116,6 +162,37 @@ int main()
            "the outer corners can use quarter-rate shading");
     Expect(WorldShadingTileRate(16, 0, 528, 256, normalEyes) == WorldTileRate::Full,
            "a hardware tile shared by the two eye images uses full rate");
+    Expect(WorldShadingTileRate(0, 0, 512, 256, normalEyes, {}, 1.21F) == WorldTileRate::FourByFour &&
+           WorldShadingTileRate(8, 8, 512, 256, normalEyes, {}, 1.21F) == WorldTileRate::Full &&
+           WorldShadingTileRate(16, 0, 528, 256, normalEyes, {}, 1.21F) == WorldTileRate::Full,
+           "4x4 only changes the far edge and protects the stereo seam");
+    const WorldVisibilityPoint diamond[]{{0.0F, -1.0F}, {1.0F, 0.0F}, {0.0F, 1.0F}, {-1.0F, 0.0F}};
+    Expect(WorldTileOutsideVisibility(diamond, 0.85F, 0.95F, 0.85F, 0.95F) &&
+           !WorldTileOutsideVisibility(diamond, 0.32F, 0.38F, 0.67F, 0.73F) &&
+           !WorldTileOutsideVisibility(diamond, -0.04F, 0.04F, -0.04F, 0.04F) &&
+           !WorldTileOutsideVisibility({}, 0.85F, 0.95F, 0.85F, 0.95F),
+           "only tiles beyond the visible contour and margin can use the stronger edge rate");
+    Expect(IsOpaqueVrsMaterial("ps_5_0\ndcl_output o0.xyzw\nmov o0, v0\nret\n"),
+           "VRS accepts one ordinary color output");
+    Expect(!IsOpaqueVrsMaterial("ps_5_0\ndcl_output o0.xyzw\ndiscard_nz r0.x\nret\n"),
+           "alpha-tested materials keep per-pixel coverage");
+    Expect(!IsOpaqueVrsMaterial("ps_5_0\ndcl_output o0.xyzw\ndcl_output oDepth\nret\n") &&
+           !IsOpaqueVrsMaterial("ps_5_0\ndcl_output o0.xyzw\ndcl_output oMask\nret\n") &&
+           !IsOpaqueVrsMaterial("ps_5_0\ndcl_output o0.xyzw\ndcl_output o1.xyz\nret\n"),
+           "depth, coverage and multi-target shaders stay at full rate");
+    Expect(!IsOpaqueVrsMaterial("ps_5_0\ndcl_output o0.xyzw\n"
+                                "dcl_input_ps_sgv constant v0.x, sample_index\nret\n"),
+           "sample-frequency shaders stay at full rate");
+    const auto defaultRadii = WorldShadingRadiiFromDegrees(35, 50);
+    const auto smallerRadii = WorldShadingRadiiFromDegrees(20, WorldShadingTransitionEnd(20));
+    Expect(Near(defaultRadii.inner, kFullRateTangent) && Near(defaultRadii.middle, kOuterRateTangent),
+           "the default angular conversion preserves the release mask");
+    Expect(WorldShadingTileRate(12, 8, 512, 256, normalEyes, defaultRadii) == WorldTileRate::Full &&
+           WorldShadingTileRate(12, 8, 512, 256, normalEyes, smallerRadii) == WorldTileRate::TwoByTwo,
+           "reducing the sharp center radius moves both shading boundaries");
+    Expect(WorldShadingTileRate(24, 8, 528, 256, normalEyes, smallerRadii) == WorldTileRate::Full &&
+           WorldShadingTileRate(16, 8, 528, 256, normalEyes, smallerRadii) == WorldTileRate::Full,
+           "smaller radii preserve eye centers and the stereo seam");
     const WorldShadingProjection wideEyes[2]{{0.5F, 1.0F, 0.0F, 0.0F},
                                               {1.0F, 1.0F, 0.0F, 0.0F}};
     Expect(WorldShadingTileRate(13, 8, 512, 256, wideEyes) == WorldTileRate::TwoByTwo &&
